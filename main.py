@@ -7,6 +7,21 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from google import genai
 from google.genai import types
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ บอททำงานปกติ 24 ชม. แล้วจ้า!"
+
+def run_server():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run_server)
+    t.start()
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -282,4 +297,5 @@ async def on_ready():
         daily_jobs.start()
 
 if __name__ == "__main__":
+    keep_alive()
     client.run(DISCORD_TOKEN)
