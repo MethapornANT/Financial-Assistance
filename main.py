@@ -190,17 +190,16 @@ client = discord.Client(intents=intents)
 
 # Action: ตรวจจับประเภท Error -> พิมพ์ Log สั้นใน Terminal และส่งข้อความแจ้งเตือนกระชับใน Discord
 async def send_clean_error(channel, error_obj):
-    err = str(error_obj).lower()
+    err = str(error_obj)
+    print(f"[ERR] Detail: {err}")
     
-    if "429" in err or "resource_exhausted" in err:
-        print("[ERR] Quota exceeded")
+    if "429" in err.lower() or "resource_exhausted" in err.lower():
         await channel.send("⏳ โควตา AI เต็ม")
-    elif "invalid json" in err or "json" in err:
-        print("[ERR] JSON parse error")
+    elif "invalid json" in err.lower() or "json" in err.lower():
         await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง")
     else:
-        print("[ERR] System error")
-        await channel.send("❌ ระบบขัดข้อง")
+        # แสดง Error สั้นๆ ออกมาดูสาเหตุ
+        await channel.send(f"❌ ระบบขัดข้อง: `{err[:100]}`")
 
 # Action: ส่งข้อความไปวิเคราะห์ผ่าน AI -> สร้างข้อความสรุปพร้อมปุ่มกด ✅ / ❌ ส่งกลับไปใน Discord
 async def handle_transaction(channel, message, mode="insert"):
