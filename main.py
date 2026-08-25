@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from datetime import datetime
 import discord
 from discord.ext import tasks
@@ -41,9 +42,12 @@ SALARY_PAY_DAY = int(os.getenv("SALARY_PAY_DAY", 25))
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Global In-Memory Cache สำหรับเก็บความจำคำศัพท์ (ประหยัด Token)
+ITEM_CACHE = {}
+
 
 # ==========================================
-# 2. DATABASE LAYER
+# 2. DATABASE LAYER & CACHE MANAGER
 # ==========================================
 def insert_transaction(msg_id: str, raw_text: str, data: dict):
     record = {
@@ -56,6 +60,14 @@ def insert_transaction(msg_id: str, raw_text: str, data: dict):
         "category": data.get("category", "ค่าสินค้า")
     }
     supabase.table("transactions").insert(record).execute()
+    
+    # อัปเดตข้อมูลเข้าสู่ RAM Cache ทันทีเมื่อมีการบันทึกใหม่
+    item_lower = data.get("item_name", "").strip().lower()
+    if item_lower:
+        ITEM_CACHE[item_lower] = {
+            "category": data.get("category", "ค่าสินค้า"),
+            "transaction_type": data.get("transaction_type", "รายจ่าย")
+        }
 
 def update_transaction(msg_id: str, raw_text: str, data: dict):
     record = {
@@ -78,12 +90,91 @@ def get_current_month_data():
     response = supabase.table("transactions").select("*").gte("created_at", start_date).execute()
     return response.data
 
+# Action: โหลดคำศัพท์ทั้งหมดจาก Supabase ลงมาเก็บไว้ใน RAM (In-Memory Cache) เพื่อลดการยิง Database และ 0 Token
+def load_item_cache_to_memory():
+    global ITEM_CACHE
+    try:
+        response = supabase.table("transactions").select("item_name, category, transaction_type").execute()
+
+        ITEM_CACHE.clear()
+
+        if response.data:
+            for row in response.data:
+                name = row.get("item_name")
+                if name and name.strip() and name.strip() != "ไม่ทราบชื่อ":
+                    ITEM_CACHE[name.strip().lower()] = {
+                        "category": row.get("category", "ค่าสินค้า"),
+                        "transaction_type": row.get("transaction_type", "รายจ่าย")
+                    }
+
+        print(f"[CACHE] โหลดความจำคำศัพท์สำเร็จ {len(ITEM_CACHE)} รายการ")
+    except Exception as e:
+        print(f"[ERR] โหลด Cache ไม่สำเร็จ: {e}")
 
 # ==========================================
-# 3. AI ENGINE
+# 3. AI ENGINE & SMART PARSER
 # ==========================================
 
-# Action: วิเคราะห์ข้อความการใช้จ่าย -> แปลงเป็น JSON โครงสร้างรายการเงิน
+# Action: สกัดชื่อสินค้าและราคาด้วย Python พื้นฐาน (0 Token) รองรับเช่น "ชาเขียว 20" หรือ "ข้าว 50"
+def extract_basic_text(text: str):
+    match = re.match(r'^\s*(.+?)\s+(\d+(?:\.\d+)?)(?:\s*บาท)?\s*$', text)
+    if match:
+        return match.group(1).strip(), float(match.group(2))
+    return None, None
+
+def extract_multiple_items(text: str, cache_dict: dict):
+    """
+    ตรวจจับรายการจากข้อความโดยเทียบกับชื่อที่เคยบันทึกใน Supabase
+    ผ่าน ITEM_CACHE เพื่อไม่ต้องเรียก Gemini สำหรับรายการที่รู้จักแล้ว
+    """
+    if not text or not cache_dict:
+        return None
+
+    transactions = []
+    remaining_text = text.strip()
+
+    cache_items = sorted(cache_dict.keys(), key=len, reverse=True)
+
+    while remaining_text:
+        found_item = False
+
+        for cache_key in cache_items:
+            pattern = rf'(?<!\S){re.escape(cache_key)}\s+(\d+(?:\.\d+)?)(?:\s*บาท)?(?=\s|$)'
+            match = re.search(pattern, remaining_text, flags=re.IGNORECASE)
+
+            if not match:
+                continue
+
+            cached_info = cache_dict[cache_key]
+            price = float(match.group(1))
+
+            clean_name = remaining_text[
+                match.start():match.start() + len(match.group(0))
+            ]
+            clean_name = re.sub(r'\s*\d+(?:\.\d+)?\s*(?:บาท)?$', '', clean_name).strip()
+
+            transactions.append({
+                "item_name": clean_name,
+                "quantity": 1,
+                "total_price": price,
+                "transaction_type": cached_info["transaction_type"],
+                "category": cached_info["category"]
+            })
+
+            remaining_text = (
+                remaining_text[:match.start()] +
+                remaining_text[match.end():]
+            ).strip()
+
+            found_item = True
+            break
+
+        if not found_item:
+            return None
+
+    return {"transactions": transactions} if transactions else None
+
+# Action: วิเคราะห์ข้อความการใช้จ่ายผ่าน AI (ทำงานเฉพาะเมื่อไม่พบใน Cache)
 async def parse_financial_text(text: str) -> dict:
     prompt = f"""วิเคราะห์: "{text}"
     ตอบ JSON เท่านั้น:
@@ -198,20 +289,39 @@ async def send_clean_error(channel, error_obj):
     elif "invalid json" in err.lower() or "json" in err.lower():
         await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง")
     else:
-        # แสดง Error สั้นๆ ออกมาดูสาเหตุ
         await channel.send(f"❌ ระบบขัดข้อง: `{err[:100]}`")
 
-# Action: ส่งข้อความไปวิเคราะห์ผ่าน AI -> สร้างข้อความสรุปพร้อมปุ่มกด ✅ / ❌ ส่งกลับไปใน Discord
+# Action: ตรวจสอบข้อความ -> ลองเช็กจาก RAM Cache ก่อน ถ้ามีใช้เลย (0 Token) ถ้าไม่มีค่อยเรียก AI
 async def handle_transaction(channel, message, mode="insert"):
     async with channel.typing():
         try:
-            data = await parse_financial_text(message.content)
-            
+            parsed_data = None
+
+            # เช็ก RAM Cache ก่อนทุกครั้ง
+            parsed_data = extract_multiple_items(message.content, ITEM_CACHE)
+
+            if parsed_data:
+                print(f"[CACHE HIT] พบรายการใน Cache แล้ว ไม่ใช้ Gemini")
+            else:
+                # ไม่พบรายการที่รู้จัก จึงค่อยเรียก Gemini
+                parsed_data = await parse_financial_text(message.content)
+
+                # จำรายการใหม่ทันที เพื่อการบันทึกครั้งถัดไปจะไม่ต้องเรียก Gemini
+                for item in parsed_data["transactions"]:
+                    name = item.get("item_name", "").strip().lower()
+                    if name:
+                        ITEM_CACHE[name] = {
+                            "category": item.get("category", "ค่าสินค้า"),
+                            "transaction_type": item.get("transaction_type", "รายจ่าย")
+                        }
+
+                print("[AI API] ไม่พบรายการใน Cache ใช้ Gemini วิเคราะห์")
+
             summary = ""
-            for item in data["transactions"]:
+            for item in parsed_data["transactions"]:
                 summary += f"• `{item['item_name']}` | {item['quantity']}x | **{item['total_price']}฿**\n"
-            
-            view = ApproveView(message.id, message.content, data, mode=mode)
+
+            view = ApproveView(message.id, message.content, parsed_data, mode=mode)
             await message.reply(summary.strip(), view=view)
         except Exception as e:
             await send_clean_error(channel, e)
@@ -289,10 +399,11 @@ async def daily_jobs():
         except Exception:
             pass
 
-# Action: เมื่อบอทล็อกอินและเชื่อมต่อ Discord สำเร็จ -> เริ่มรัน Background Task ทันที
+# Action: เมื่อบอทล็อกอินและเชื่อมต่อ Discord สำเร็จ -> โหลด Cache คำศัพท์เข้า RAM และเริ่มรัน Background Task
 @client.event
 async def on_ready():
     print(f"[OK] Online as {client.user}")
+    load_item_cache_to_memory() # โหลดข้อมูลคำศัพท์ทั้งหมดจาก DB มาเก็บไว้บน RAM ทันที
     if not daily_jobs.is_running(): 
         daily_jobs.start()
 
