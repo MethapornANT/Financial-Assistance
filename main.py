@@ -2,6 +2,8 @@ import os
 import json
 import re
 import sys
+import pandas as pd
+import io
 from datetime import datetime
 import discord
 from discord.ext import tasks
@@ -11,6 +13,7 @@ from google import genai
 from google.genai import types
 from flask import Flask
 from threading import Thread
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
@@ -50,11 +53,27 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 # Global In-Memory Cache สำหรับเก็บความจำคำศัพท์ (ประหยัด Token)
 ITEM_CACHE = {}
 
+# รายการคำศัพท์ตรวจจับคำถาม (Global Query Keywords)
+QUERY_KEYWORDS = [
+        'เท่าไร', 'เท่าไหร่', 'กี่บาท', 'ยอดรวม', 'ยอดทั้งหมด', 'ยอดใช้จ่าย',
+        'หมดไป', 'จ่ายไป', 'ใช้ไป', 'โดนไป', 'เสียไป',
+        'อะไรบ้าง', 'ค่าไร', 'ค่าอะไร', 'ซื้อไร', 'ซื้ออะไร', 'จ่ายไร', 'จ่ายอะไร',
+        'มีไรบ้าง', 'ทำไรไป',
+        'เหลือเงิน', 'เงินเหลือ', 'งบเหลือ', 'เหลือเท่า',
+        'สรุป', 'แพงสุด', 'มากสุด', 'เยอะสุด', 'บ่อยสุด', 'หมวดไหน', 'อันไหน',
+        'ไฟล์', 'excel', 'รายงาน', 'export', 'ชีต',
+        'ไหม', 'มั้ย', 'หรอ', 'เหรอ', 'ป่าว', 'เปล่า', 'รึเปล่า', 'หรือเปล่า', 
+        'รึยัง', 'หรือยัง', 'บ้าง', 'มั่ง', 'ยังไง', '?',
+        'วัน', 'เดือน', 'ปี', 'เมื่อวาน', 'ย้อนหลัง', 'ที่ผ่านมา', 'ก่อน'
+    ]
 
 # ==========================================
 # 2. DATABASE LAYER & CACHE MANAGER
 # ==========================================
 def insert_transaction(msg_id: str, raw_text: str, data: dict):
+    # กำหนดเวลาปัจจุบันแบบ วัน-เดือน-ปี ชัวโมง:นาที:วินาที (ไม่เอาเศษวินาทีและ Timezone)
+    current_time_clean = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     record = {
         "discord_msg_id": msg_id,
         "raw_text": raw_text,
@@ -62,11 +81,11 @@ def insert_transaction(msg_id: str, raw_text: str, data: dict):
         "quantity": data.get("quantity", 1),
         "total_price": data.get("total_price", 0),
         "transaction_type": data.get("transaction_type", "รายจ่าย"),
-        "category": data.get("category", "ค่าสินค้า")
+        "category": data.get("category", "ค่าสินค้า"),
+        "created_at": current_time_clean  # บันทึกลง Database แบบสะอาด
     }
     supabase.table("transactions").insert(record).execute()
     
-    # อัปเดตข้อมูลเข้าสู่ RAM Cache ทันทีเมื่อมีการบันทึกใหม่
     item_lower = data.get("item_name", "").strip().lower()
     if item_lower:
         ITEM_CACHE[item_lower] = {
@@ -95,7 +114,6 @@ def get_current_month_data():
     response = supabase.table("transactions").select("*").gte("created_at", start_date).execute()
     return response.data
 
-# Action: โหลดคำศัพท์ทั้งหมดจาก Supabase ลงมาเก็บไว้ใน RAM (In-Memory Cache) เพื่อลดการยิง Database และ 0 Token
 def load_item_cache_to_memory():
     global ITEM_CACHE
     try:
@@ -112,7 +130,6 @@ def load_item_cache_to_memory():
                         "transaction_type": row.get("transaction_type", "รายจ่าย")
                     }
 
-        # ใช้ Log ภาษาอังกฤษล้วน ป้องกัน charmap error
         print(f"[CACHE] Successfully loaded {len(ITEM_CACHE)} items.")
     except Exception as e:
         print(f"[ERR] Cache load failed: {e}")
@@ -120,30 +137,16 @@ def load_item_cache_to_memory():
 # ==========================================
 # 3. AI ENGINE & SMART PARSER
 # ==========================================
-
-# Action: สกัดชื่อสินค้าและราคาด้วย Python พื้นฐาน (0 Token) รองรับเช่น "ชาเขียว 20" หรือ "ข้าว 50"
-def extract_basic_text(text: str):
-    match = re.match(r'^\s*(.+?)\s+(\d+(?:\.\d+)?)(?:\s*บาท)?\s*$', text)
-    if match:
-        return match.group(1).strip(), float(match.group(2))
-    return None, None
-
 def extract_multiple_items(text: str, cache_dict: dict):
-    """
-    ตรวจจับรายการจากข้อความโดยเทียบกับชื่อที่เคยบันทึกใน Supabase
-    ผ่าน ITEM_CACHE เพื่อไม่ต้องเรียก Gemini สำหรับรายการที่รู้จักแล้ว
-    """
     if not text or not cache_dict:
         return None
 
     transactions = []
     remaining_text = text.strip()
-
     cache_items = sorted(cache_dict.keys(), key=len, reverse=True)
 
     while remaining_text:
         found_item = False
-
         for cache_key in cache_items:
             pattern = rf'(?<!\S){re.escape(cache_key)}\s+(\d+(?:\.\d+)?)(?:\s*บาท)?(?=\s|$)'
             match = re.search(pattern, remaining_text, flags=re.IGNORECASE)
@@ -154,9 +157,7 @@ def extract_multiple_items(text: str, cache_dict: dict):
             cached_info = cache_dict[cache_key]
             price = float(match.group(1))
 
-            clean_name = remaining_text[
-                match.start():match.start() + len(match.group(0))
-            ]
+            clean_name = remaining_text[match.start():match.start() + len(match.group(0))]
             clean_name = re.sub(r'\s*\d+(?:\.\d+)?\s*(?:บาท)?$', '', clean_name).strip()
 
             transactions.append({
@@ -167,11 +168,7 @@ def extract_multiple_items(text: str, cache_dict: dict):
                 "category": cached_info["category"]
             })
 
-            remaining_text = (
-                remaining_text[:match.start()] +
-                remaining_text[match.end():]
-            ).strip()
-
+            remaining_text = (remaining_text[:match.start()] + remaining_text[match.end():]).strip()
             found_item = True
             break
 
@@ -180,11 +177,12 @@ def extract_multiple_items(text: str, cache_dict: dict):
 
     return {"transactions": transactions} if transactions else None
 
-# Action: วิเคราะห์ข้อความการใช้จ่ายผ่าน AI (ทำงานเฉพาะเมื่อไม่พบใน Cache)
-async def parse_financial_text(text: str) -> dict:
-    prompt = f"""วิเคราะห์: "{text}"
-    ตอบ JSON เท่านั้น:
+async def parse_intent(text: str) -> dict:
+    prompt = f"""วิเคราะห์ข้อความ: "{text}"
+    แยกแยะว่าผู้ใช้ต้องการ "บันทึกรายจ่าย/รายรับ" (transaction) หรือ "ถามข้อมูล/ขอสรุป" (query)
+    ตอบเป็น JSON เท่านั้น:
     {{
+        "action": "transaction" หรือ "query",
         "transactions": [
             {{
                 "item_name": "ชื่อรายการสั้นๆ",
@@ -193,11 +191,13 @@ async def parse_financial_text(text: str) -> dict:
                 "transaction_type": "รายรับ" หรือ "รายจ่าย",
                 "category": "ค่าอาหาร" | "ค่าบริการ" | "ค่าสินค้า" | "รายได้" | "เงินเดือน"
             }}
-        ]
-    }}"""
+        ] 
+    }}
+    *หมายเหตุ: ถ้า action เป็น query ให้ปล่อย transactions เป็น [] ได้เลย
+    """
     
     response = await ai_client.aio.models.generate_content(
-        model='gemini-3.5-flash-lite',
+        model='gemini-3.5-flash', # ใช้รุ่นที่ฟรี 1,500 ครั้ง/วัน และเสถียรที่สุด
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
     )
@@ -208,21 +208,33 @@ async def parse_financial_text(text: str) -> dict:
         return json.loads(raw_text[start_idx:end_idx])
     raise ValueError("Invalid JSON")
 
-# Action: วิเคราะห์คำถามเกี่ยวกับข้อมูลการเงินเดือนนี้ -> ตอบสรุปสั้นๆ พร้อม Emoji หมวดหมู่
-async def answer_smart_query(question: str, db_data: list) -> str:
+# Action: วิเคราะห์คำถามเกี่ยวกับข้อมูล -> ตอบแบบลิสต์สวยงาม ห้ามสร้างตาราง
+async def answer_smart_query(question: str, db_data: list) -> dict:
     prompt = f"""
     คำถาม: "{question}"
-    ข้อมูล: {json.dumps(db_data, ensure_ascii=False)}
-    ตอบให้สั้นที่สุด ตรงประเด็น ห้ามเวิ่นเว้อ
-    ใช้ Emoji 1 ตัว เฉพาะคู่กับชื่อ "หมวดหมู่" เท่านั้น (เช่น 🍽️ ค่าอาหาร, 🚌 ค่าบริการ) ห้ามใส่ Emoji ที่อื่นเด็ดขาด
+    วันที่ปัจจุบัน: {datetime.now().strftime('%Y-%m-%d')}
+    ข้อมูล Database: {json.dumps(db_data, ensure_ascii=False)}
+
+    หน้าที่:
+    1. วิเคราะห์ช่วงวันที่ที่ผู้ใช้ถาม (เช่น 'วันที่ 17-20', 'เมื่อวาน') เพื่อคัดกรองข้อมูล
+    2. สรุปข้อมูล (ห้ามสร้างตารางเด็ดขาด ให้ตอบเป็นบรรทัดๆ)
+    3. ส่งกลับมาเป็น JSON ตามโครงสร้างนี้:
+    {{
+        "start_date": "YYYY-MM-DD" (หรือ null ถ้าไม่ระบุวัน),
+        "end_date": "YYYY-MM-DD" (หรือ null ถ้าไม่ระบุวัน),
+        "summary_text": "[Emoji] [หมวดหมู่]:\\n- [ชื่อ]: [ราคา] บาท\\n\\nรวมทั้งหมด: [ยอดรวม] บาท"
+    }}
     """
     response = await ai_client.aio.models.generate_content(
-        model='gemini-3.6-flash',
+        model='gemini-3.5-flash',
         contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.0)
+        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
     )
-    return response.text
-
+    raw_text = response.text.strip()
+    start_idx, end_idx = raw_text.find('{'), raw_text.rfind('}') + 1
+    if start_idx != -1 and end_idx != 0:
+        return json.loads(raw_text[start_idx:end_idx])
+    return {"start_date": None, "end_date": None, "summary_text": "❌ วิเคราะห์คำถามไม่สำเร็จ"}
 
 # ==========================================
 # 4. DISCORD UI
@@ -235,7 +247,6 @@ class ApproveView(discord.ui.View):
         self.parsed_data = parsed_data
         self.mode = mode
 
-    # Action: ผู้ใช้กดปุ่ม ✅ -> บันทึกหรืออัปเดตข้อมูลลง Supabase แล้วแก้ไขข้อความปุ่มออก
     @discord.ui.button(label="✅", style=discord.ButtonStyle.success)
     async def approve_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != ALLOWED_USER_ID: return
@@ -249,7 +260,6 @@ class ApproveView(discord.ui.View):
 
         await interaction.response.edit_message(content="✅ บันทึกแล้ว", view=None)
 
-    # Action: ผู้ใช้กดปุ่ม ❌ -> ยกเลิกรายการและลบปุ่มยืนยันออก
     @discord.ui.button(label="❌", style=discord.ButtonStyle.danger)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != ALLOWED_USER_ID: return
@@ -259,7 +269,6 @@ class QuickActionView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    # Action: ผู้ใช้กดปุ่มด่วนกาแฟ -> บันทึก 50 บาทลง Supabase ทันที ไม่ผ่าน AI
     @discord.ui.button(label="☕ กาแฟ 50฿", style=discord.ButtonStyle.primary)
     async def coffee_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != ALLOWED_USER_ID: return
@@ -268,7 +277,6 @@ class QuickActionView(discord.ui.View):
         insert_transaction(msg_id, "Quick-Coffee", data)
         await interaction.response.send_message("✅ บันทึกกาแฟ 50฿", ephemeral=True)
 
-    # Action: ผู้ใช้กดปุ่มด่วนข้าว -> บันทึก 60 บาทลง Supabase ทันที ไม่ผ่าน AI
     @discord.ui.button(label="🍜 ข้าว 60฿", style=discord.ButtonStyle.primary)
     async def food_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != ALLOWED_USER_ID: return
@@ -277,7 +285,6 @@ class QuickActionView(discord.ui.View):
         insert_transaction(msg_id, "Quick-Food", data)
         await interaction.response.send_message("✅ บันทึกข้าว 60฿", ephemeral=True)
 
-
 # ==========================================
 # 5. DISCORD EVENTS & CLEAN LOGS
 # ==========================================
@@ -285,44 +292,114 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# Action: ตรวจจับประเภท Error -> พิมพ์ Log สั้นใน Terminal และส่งข้อความแจ้งเตือนกระชับใน Discord
 async def send_clean_error(channel, error_obj):
-    err_msg = str(error_obj).lower()
-    
-    # พิมพ์ Log ลง Server เฉพาะเท่าที่จำเป็น (ใช้ Try กันเหนียว)
+    err = str(error_obj).lower()
     try:
         print(f"[SYS_ERR] {str(error_obj)}")
     except Exception:
         pass
 
-    # กรอง Error ไปแสดงหน้า Discord แบบผู้ใช้ทั่วไปเข้าใจง่าย
-    if "429" in err_msg or "resource_exhausted" in err_msg:
-        await channel.send("⏳ โควตา AI รายวันเต็มแล้ว (ระบบจะรีเซ็ตช่วง 14:00 น.)")
-    elif "invalid json" in err_msg or "json" in err_msg:
-        await channel.send("❌ AI วิเคราะห์ข้อมูลไม่สำเร็จ โปรดพิมพ์รายการใหม่อีกครั้ง")
-    elif "charmap" in err_msg or "codec" in err_msg:
-        # บังคับซ่อน Error เกี่ยวกับ Font/Terminal ออกจากหน้า Discord เด็ดขาด
+    if "429" in err or "resource_exhausted" in err:
+        await channel.send("⏳ โควตา AI รายวันเต็มแล้ว")
+    elif "invalid json" in err or "json" in err:
+        await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง")
+    elif "charmap" in err or "codec" in err:
         pass 
     else:
-        # Error ทั่วไป ไม่โชว์ Code ยาวๆ
-        await channel.send("❌ ระบบขัดข้อง: ไม่สามารถบันทึกรายการได้ในขณะนี้")
+        await channel.send("❌ ระบบขัดข้อง ไม่สามารถประมวลผลได้")
 
-# Action: ตรวจสอบข้อความ -> ลองเช็กจาก RAM Cache ก่อน ถ้ามีใช้เลย (0 Token) ถ้าไม่มีค่อยเรียก AI
-async def handle_transaction(channel, message, mode="insert"):
+# UI ชุดที่ 1: สำหรับการบันทึกรายการ (มีปุ่ม ✅ / ❌)
+async def process_transaction_ui(channel, message, parsed_data, mode, used_ai):
+    summary = ""
+    for item in parsed_data["transactions"]:
+        summary += f"• `{item['item_name']}` | {item['quantity']}x | **{item['total_price']}฿**\n"
+    
+    source_tag = "🧠 `[AI วิเคราะห์]`" if used_ai else "⚡ `[RAM Cache - 0 Token]`"
+    final_msg = f"{summary.strip()}\n{source_tag}"
+    
+    view = ApproveView(message.id, message.content, parsed_data, mode=mode)
+    await message.reply(final_msg, view=view)
+
+# UI ชุดที่ 2: สำหรับตอบคำถาม & ออกรายงาน Excel (ไม่มีปุ่ม)
+async def process_query_ui(channel, message, query_result, db_data):
+    summary_text = query_result.get("summary_text", "ไม่พบข้อมูล")
+    start_date = query_result.get("start_date")
+    end_date = query_result.get("end_date")
+    
+    file_keywords = ['ไฟล์', 'excel', 'รายงาน', 'export', 'ชีต']
+    wants_file = any(kw in message.content.lower() for kw in file_keywords)
+    
+    if wants_file and db_data:
+        df = pd.DataFrame(db_data)
+        if not df.empty and 'created_at' in df.columns:
+            # แปลงเวลาให้เป็น YYYY-MM-DD HH:MM:SS สะอาดๆ
+            df['created_at'] = pd.to_datetime(df['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # ใช้ 10 ตัวแรก (YYYY-MM-DD) สำหรับเทียบวันที่
+            df['date_only'] = df['created_at'].str[:10]
+            
+            # กรองข้อมูลตามวันที่
+            if start_date and end_date:
+                df = df[(df['date_only'] >= start_date) & (df['date_only'] <= end_date)]
+            elif start_date:
+                df = df[df['date_only'] == start_date]
+
+            cols = [c for c in ['created_at', 'item_name', 'category', 'transaction_type', 'quantity', 'total_price'] if c in df.columns]
+            df = df[cols]
+            df.rename(columns={
+                'created_at': 'วัน/เวลา',
+                'item_name': 'ชื่อรายการ',
+                'category': 'หมวดหมู่',
+                'transaction_type': 'ประเภท',
+                'quantity': 'จำนวน',
+                'total_price': 'ราคา (บาท)'
+            }, inplace=True)
+        
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Summary')
+        buffer.seek(0)
+        
+        # 🟢 ปรับ Logic การตั้งชื่อไฟล์ให้ตรงกับคำขอ
+        if start_date and end_date and start_date != end_date:
+            # กรณีระบุช่วงหลายวัน
+            file_name = f"Report_{start_date.replace('-', '_')}_to_{end_date.replace('-', '_')}.xlsx"
+        elif start_date:
+            # กรณีระบุวันเดียว (หรือ start_date ตรงกับ end_date)
+            file_name = f"Report_{start_date.replace('-', '_')}.xlsx"
+        else:
+            # กรณีดูทั้งเดือน
+            file_name = f"Report_Month_{datetime.now().strftime('%Y_%m')}.xlsx"
+            
+        await message.reply(summary_text, file=discord.File(fp=buffer, filename=file_name))
+    else:
+        await message.reply(summary_text)
+
+# Central Router: ทำหน้าที่จ่ายงาน
+async def handle_incoming_message(channel, message, mode="insert"):
     async with channel.typing():
         try:
+            # 1. เช็กสมองตัวเองก่อน (Cache) - ถ้าเจอถือว่าบันทึกชัวร์ 0 Token
             parsed_data = extract_multiple_items(message.content, ITEM_CACHE)
-            used_ai = False
-
+            
             if parsed_data:
-                # Log อังกฤษล้วน + ไม่ดึง message.content มาปริ้นท์ให้ติด charmap
                 print("[CACHE HIT] Item matched in memory (0 Token)")
-            else:
-                used_ai = True
-                print("[AI API] Cache miss. Forwarding request to Gemini...")
-                parsed_data = await parse_financial_text(message.content)
+                await process_transaction_ui(channel, message, parsed_data, mode, used_ai=False)
+                return
 
-                # จำคำใหม่เข้า RAM ทันที
+            # 2. ถ้าหลุด Cache ให้ AI วิเคราะห์เจตนา (Transaction หรือ Query)
+            print("[AI API] Cache miss. Forwarding request to Gemini for Intent Classification...")
+            intent_data = await parse_intent(message.content)
+
+            if intent_data.get("action") == "query":
+                # 🟢 3A: AI บอกว่าเป็นคำถาม -> ดึง DB, ให้ AI สรุปข้อมูล, ส่ง Excel แบบไม่มีปุ่ม
+                db_data = get_current_month_data()
+                query_result = await answer_smart_query(message.content, db_data)
+                await process_query_ui(channel, message, query_result, db_data)
+            else:
+                # 🟢 3B: AI บอกว่าเป็นการบันทึก -> บันทึก Cache เผื่ออนาคต, ส่งปุ่ม Approve ให้ยืนยัน
+                parsed_data = {"transactions": intent_data.get("transactions", [])}
+                
                 for item in parsed_data["transactions"]:
                     name = item.get("item_name", "").strip().lower()
                     if name:
@@ -330,66 +407,34 @@ async def handle_transaction(channel, message, mode="insert"):
                             "category": item.get("category", "ค่าสินค้า"),
                             "transaction_type": item.get("transaction_type", "รายจ่าย")
                         }
+                
+                await process_transaction_ui(channel, message, parsed_data, mode, used_ai=True)
 
-            summary = ""
-            for item in parsed_data["transactions"]:
-                summary += f"• `{item['item_name']}` | {item['quantity']}x | **{item['total_price']}฿**\n"
-            
-            # ติด Tag ให้เห็นใน Discord ว่ามาจากไหน
-            source_tag = "🧠 `[AI วิเคราะห์]`" if used_ai else "⚡ `[RAM Cache - 0 Token]`"
-            final_msg = f"{summary.strip()}\n{source_tag}"
-
-            view = ApproveView(message.id, message.content, parsed_data, mode=mode)
-            await message.reply(final_msg, view=view)
-        except Exception as e:
-            # โยน Exception ให้ฟังก์ชันเคลียร์ Log ทันที
-            await send_clean_error(channel, e)
-            
-# Action: ดึงข้อมูลเดือนนี้จาก Supabase -> ให้ AI ประมวลผลคำตอบแล้วส่งข้อความตอบกลับผู้ใช้
-async def handle_smart_query(channel, message):
-    async with channel.typing():
-        try:
-            db_data = get_current_month_data()
-            answer = await answer_smart_query(message.content, db_data)
-            await message.reply(answer)
         except Exception as e:
             await send_clean_error(channel, e)
 
-# Action: ดักจับข้อความใหม่ -> คัดกรองว่าเป็นคำสั่ง !menu, คำถาม (Query) หรือ รายการบันทึก (Transaction)
 @client.event
 async def on_message(message):
-    if message.type not in (discord.MessageType.default, discord.MessageType.reply):
-        return
-    if message.author.id != ALLOWED_USER_ID or message.author == client.user: 
-        return
+    if message.type not in (discord.MessageType.default, discord.MessageType.reply): return
+    if message.author.id != ALLOWED_USER_ID or message.author == client.user: return
 
     text = message.content.strip()
     if text.lower() == "!menu":
         await message.channel.send("⚡ เมนูด่วน", view=QuickActionView())
         return
 
-    query_keywords = ['เท่าไร', 'เท่าไหร่', 'อะไรบ้าง', 'สรุป', 'ไหม', '?']
-    is_query = any(keyword in text for keyword in query_keywords)
+    # ลบ List คำศัพท์ดักคำถามทิ้งไปได้เลย และโยนทุกอย่างเข้าสู่ Router กลาง
+    await handle_incoming_message(message.channel, message, mode="insert")
 
-    if is_query:
-        await handle_smart_query(message.channel, message)
-    else:
-        await handle_transaction(message.channel, message, mode="insert")
-
-# Action: ดักจับการกด Edit ข้อความเดิมใน Discord -> ส่งข้อความแก้ไขไปประมวลผลใหม่เพื่ออัปเดตแถวเดิม
 @client.event
 async def on_message_edit(before, after):
     if after.type not in (discord.MessageType.default, discord.MessageType.reply): return
     if after.author.id != ALLOWED_USER_ID or after.author == client.user: return
     if before.content == after.content: return
     
-    query_keywords = ['เท่าไร', 'เท่าไหร่', 'อะไรบ้าง', 'สรุป', 'ไหม', '?']
-    is_query = any(keyword in after.content for keyword in query_keywords)
-    
-    if not is_query:
-        await handle_transaction(after.channel, after, mode="update")
+    # ลบ List คำศัพท์ดักคำถามทิ้ง และโยนให้ Router กลางจัดการแบบอัปเดต
+    await handle_incoming_message(after.channel, after, mode="update")
 
-# Action: ดักจับการลบข้อความใน Discord -> ทำการ DELETE ข้อมูลที่มี msg_id ตรงกันออกจาก Supabase ทันที
 @client.event
 async def on_raw_message_delete(payload):
     try:
@@ -400,12 +445,9 @@ async def on_raw_message_delete(payload):
     except Exception:
         pass
 
-
 # ==========================================
 # 6. AUTOMATION
 # ==========================================
-
-# Action: ทำงานเบื้องหลังทุก 24 ชั่วโมง -> ตรวจสอบว่าตรงกับวันเงินเดือนออกหรือไม่ ถ้าตรงให้บันทึก Auto-Salary
 @tasks.loop(hours=24)
 async def daily_jobs():
     today = datetime.now()
@@ -418,11 +460,10 @@ async def daily_jobs():
         except Exception:
             pass
 
-# Action: เมื่อบอทล็อกอินและเชื่อมต่อ Discord สำเร็จ -> โหลด Cache คำศัพท์เข้า RAM และเริ่มรัน Background Task
 @client.event
 async def on_ready():
     print(f"[OK] Online as {client.user}")
-    load_item_cache_to_memory() # โหลดข้อมูลคำศัพท์ทั้งหมดจาก DB มาเก็บไว้บน RAM ทันที
+    load_item_cache_to_memory()
     if not daily_jobs.is_running(): 
         daily_jobs.start()
 
