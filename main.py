@@ -19,7 +19,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ บอททำงานปกติ 24 ชม. แล้วจ้า!"
+    return "OK", 200, {'Content-Type': 'text/plain'}
 
 def run_server():
     port = int(os.environ.get("PORT", 8080))
@@ -314,7 +314,7 @@ async def process_transaction_ui(channel, message, parsed_data, mode, used_ai):
     for item in parsed_data["transactions"]:
         summary += f"• `{item['item_name']}` | {item['quantity']}x | **{item['total_price']}฿**\n"
     
-    source_tag = "🧠 `[AI วิเคราะห์]`" if used_ai else "⚡ `[RAM Cache - 0 Token]`"
+    source_tag = "🧠 `[AI]`" if used_ai else "⚡ `[RAM]`"
     final_msg = f"{summary.strip()}\n{source_tag}"
     
     view = ApproveView(message.id, message.content, parsed_data, mode=mode)
