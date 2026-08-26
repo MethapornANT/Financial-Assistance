@@ -22,7 +22,11 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "OK", 200, {'Content-Type': 'text/plain'}
+    return '', 204
+
+@app.route('/healthz')
+def healthz():
+    return 'ok', 200, {'Content-Type': 'text/plain'}
 
 def run_server():
     port = int(os.environ.get("PORT", 8080))
