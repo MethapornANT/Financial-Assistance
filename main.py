@@ -94,15 +94,15 @@ def get_current_month_data():
 def load_item_cache_to_memory():
     global ITEM_CACHE
     try:
-        response = supabase.table("transactions").select("item_name, category, transaction_type").execute()
-
+        response = supabase.table("transactions").select("item_name, category, transaction_type").limit(10000).execute()
         ITEM_CACHE.clear()
 
         if response.data:
             for row in response.data:
                 name = row.get("item_name")
-                if name and name.strip() and name.strip() != "ไม่ทราบชื่อ":
-                    ITEM_CACHE[name.strip().lower()] = {
+                if name and isinstance(name, str) and name.strip() and name.strip() != "ไม่ทราบชื่อ":
+                    clean_key = name.strip().lower()
+                    ITEM_CACHE[clean_key] = {
                         "category": row.get("category", "ค่าสินค้า"),
                         "transaction_type": row.get("transaction_type", "รายจ่าย")
                     }
@@ -296,17 +296,20 @@ async def handle_transaction(channel, message, mode="insert"):
     async with channel.typing():
         try:
             parsed_data = None
+            used_ai = False
 
-            # เช็ก RAM Cache ก่อนทุกครั้ง
+            # เช็ก RAM Cache ก่อน
             parsed_data = extract_multiple_items(message.content, ITEM_CACHE)
 
             if parsed_data:
-                print(f"[CACHE HIT] พบรายการใน Cache แล้ว ไม่ใช้ Gemini")
+                print(f"[CACHE HIT] ทุกรายการอยู่ใน Cache แล้ว (0 Token)")
             else:
-                # ไม่พบรายการที่รู้จัก จึงค่อยเรียก Gemini
+                # หลุดไปหา AI
+                used_ai = True
+                print(f"[AI API] ไม่พบใน Cache วิ่งไปหา Gemini: '{message.content}'")
                 parsed_data = await parse_financial_text(message.content)
 
-                # จำรายการใหม่ทันที เพื่อการบันทึกครั้งถัดไปจะไม่ต้องเรียก Gemini
+                # จำคำใหม่เข้า RAM ทันที
                 for item in parsed_data["transactions"]:
                     name = item.get("item_name", "").strip().lower()
                     if name:
@@ -315,14 +318,16 @@ async def handle_transaction(channel, message, mode="insert"):
                             "transaction_type": item.get("transaction_type", "รายจ่าย")
                         }
 
-                print("[AI API] ไม่พบรายการใน Cache ใช้ Gemini วิเคราะห์")
-
             summary = ""
             for item in parsed_data["transactions"]:
                 summary += f"• `{item['item_name']}` | {item['quantity']}x | **{item['total_price']}฿**\n"
+            
+            # ติด Tag ให้เห็นใน Discord ว่าใช้ Cache หรือ AI
+            source_tag = "🧠 `[AI วิเคราะห์]`" if used_ai else "⚡ `[RAM Cache - 0 Token]`"
+            final_msg = f"{summary.strip()}\n{source_tag}"
 
             view = ApproveView(message.id, message.content, parsed_data, mode=mode)
-            await message.reply(summary.strip(), view=view)
+            await message.reply(final_msg, view=view)
         except Exception as e:
             await send_clean_error(channel, e)
 
