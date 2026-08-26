@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import sys
 from datetime import datetime
 import discord
 from discord.ext import tasks
@@ -24,6 +25,10 @@ def run_server():
 def keep_alive():
     t = Thread(target=run_server)
     t.start()
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -191,7 +196,7 @@ async def parse_financial_text(text: str) -> dict:
     }}"""
     
     response = await ai_client.aio.models.generate_content(
-        model='gemini-3.6-flash',
+        model='gemini-3.5-flash-lite',
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
     )
@@ -282,10 +287,15 @@ client = discord.Client(intents=intents)
 # Action: ตรวจจับประเภท Error -> พิมพ์ Log สั้นใน Terminal และส่งข้อความแจ้งเตือนกระชับใน Discord
 async def send_clean_error(channel, error_obj):
     err = str(error_obj)
-    print(f"[ERR] Detail: {err}")
+    try:
+        print(f"[ERR] Detail: {err}")
+    except UnicodeEncodeError:
+        print("[ERR] Encoding error in terminal output")
     
     if "429" in err.lower() or "resource_exhausted" in err.lower():
         await channel.send("⏳ โควตา AI เต็ม")
+    elif "charmap" in err.lower():
+        pass  # ข้าม error encoding ของ console ไม่ต้องส่งเข้า discord
     elif "invalid json" in err.lower() or "json" in err.lower():
         await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง")
     else:
