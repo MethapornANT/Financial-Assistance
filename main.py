@@ -112,9 +112,10 @@ def load_item_cache_to_memory():
                         "transaction_type": row.get("transaction_type", "รายจ่าย")
                     }
 
-        print(f"[CACHE] โหลดความจำคำศัพท์สำเร็จ {len(ITEM_CACHE)} รายการ")
+        # ใช้ Log ภาษาอังกฤษล้วน ป้องกัน charmap error
+        print(f"[CACHE] Successfully loaded {len(ITEM_CACHE)} items.")
     except Exception as e:
-        print(f"[ERR] โหลด Cache ไม่สำเร็จ: {e}")
+        print(f"[ERR] Cache load failed: {e}")
 
 # ==========================================
 # 3. AI ENGINE & SMART PARSER
@@ -286,37 +287,39 @@ client = discord.Client(intents=intents)
 
 # Action: ตรวจจับประเภท Error -> พิมพ์ Log สั้นใน Terminal และส่งข้อความแจ้งเตือนกระชับใน Discord
 async def send_clean_error(channel, error_obj):
-    err = str(error_obj)
-    try:
-        print(f"[ERR] Detail: {err}")
-    except UnicodeEncodeError:
-        print("[ERR] Encoding error in terminal output")
+    err_msg = str(error_obj).lower()
     
-    if "429" in err.lower() or "resource_exhausted" in err.lower():
-        await channel.send("⏳ โควตา AI เต็ม")
-    elif "charmap" in err.lower():
-        pass  # ข้าม error encoding ของ console ไม่ต้องส่งเข้า discord
-    elif "invalid json" in err.lower() or "json" in err.lower():
-        await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง")
+    # พิมพ์ Log ลง Server เฉพาะเท่าที่จำเป็น (ใช้ Try กันเหนียว)
+    try:
+        print(f"[SYS_ERR] {str(error_obj)}")
+    except Exception:
+        pass
+
+    # กรอง Error ไปแสดงหน้า Discord แบบผู้ใช้ทั่วไปเข้าใจง่าย
+    if "429" in err_msg or "resource_exhausted" in err_msg:
+        await channel.send("⏳ โควตา AI รายวันเต็มแล้ว (ระบบจะรีเซ็ตช่วง 14:00 น.)")
+    elif "invalid json" in err_msg or "json" in err_msg:
+        await channel.send("❌ AI วิเคราะห์ข้อมูลไม่สำเร็จ โปรดพิมพ์รายการใหม่อีกครั้ง")
+    elif "charmap" in err_msg or "codec" in err_msg:
+        # บังคับซ่อน Error เกี่ยวกับ Font/Terminal ออกจากหน้า Discord เด็ดขาด
+        pass 
     else:
-        await channel.send(f"❌ ระบบขัดข้อง: `{err[:100]}`")
+        # Error ทั่วไป ไม่โชว์ Code ยาวๆ
+        await channel.send("❌ ระบบขัดข้อง: ไม่สามารถบันทึกรายการได้ในขณะนี้")
 
 # Action: ตรวจสอบข้อความ -> ลองเช็กจาก RAM Cache ก่อน ถ้ามีใช้เลย (0 Token) ถ้าไม่มีค่อยเรียก AI
 async def handle_transaction(channel, message, mode="insert"):
     async with channel.typing():
         try:
-            parsed_data = None
+            parsed_data = extract_multiple_items(message.content, ITEM_CACHE)
             used_ai = False
 
-            # เช็ก RAM Cache ก่อน
-            parsed_data = extract_multiple_items(message.content, ITEM_CACHE)
-
             if parsed_data:
-                print(f"[CACHE HIT] ทุกรายการอยู่ใน Cache แล้ว (0 Token)")
+                # Log อังกฤษล้วน + ไม่ดึง message.content มาปริ้นท์ให้ติด charmap
+                print("[CACHE HIT] Item matched in memory (0 Token)")
             else:
-                # หลุดไปหา AI
                 used_ai = True
-                print(f"[AI API] ไม่พบใน Cache วิ่งไปหา Gemini: '{message.content}'")
+                print("[AI API] Cache miss. Forwarding request to Gemini...")
                 parsed_data = await parse_financial_text(message.content)
 
                 # จำคำใหม่เข้า RAM ทันที
@@ -332,15 +335,16 @@ async def handle_transaction(channel, message, mode="insert"):
             for item in parsed_data["transactions"]:
                 summary += f"• `{item['item_name']}` | {item['quantity']}x | **{item['total_price']}฿**\n"
             
-            # ติด Tag ให้เห็นใน Discord ว่าใช้ Cache หรือ AI
+            # ติด Tag ให้เห็นใน Discord ว่ามาจากไหน
             source_tag = "🧠 `[AI วิเคราะห์]`" if used_ai else "⚡ `[RAM Cache - 0 Token]`"
             final_msg = f"{summary.strip()}\n{source_tag}"
 
             view = ApproveView(message.id, message.content, parsed_data, mode=mode)
             await message.reply(final_msg, view=view)
         except Exception as e:
+            # โยน Exception ให้ฟังก์ชันเคลียร์ Log ทันที
             await send_clean_error(channel, e)
-
+            
 # Action: ดึงข้อมูลเดือนนี้จาก Supabase -> ให้ AI ประมวลผลคำตอบแล้วส่งข้อความตอบกลับผู้ใช้
 async def handle_smart_query(channel, message):
     async with channel.typing():
