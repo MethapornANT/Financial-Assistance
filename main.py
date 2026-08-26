@@ -138,42 +138,60 @@ def load_item_cache_to_memory():
 # 3. AI ENGINE & SMART PARSER
 # ==========================================
 def extract_multiple_items(text: str, cache_dict: dict):
-    if not text or not cache_dict:
+    """
+    Parser อัจฉริยะ: ดึงรายการได้ทุกรูปแบบ (บรรทัดเดียว, หลายบรรทัด, เคาะเว้นวรรค, หรือพิมพ์ติดกัน)
+    รองรับ: 'น้ำ7\nมาม่า 25', 'น้ำ 7 มาม่า 25', 'หมาล่า50บาท' แบบ 0 Token
+    """
+    if not text:
+        return None
+
+    # กรองข้อความให้สะอาด จัดการ Enter (\n) และ Space ซ้ำๆ ให้เป็นบรรทัดมาตรฐาน
+    lines = text.strip().splitlines()
+    target_segments = []
+    for line in lines:
+        cleaned_line = line.strip()
+        if cleaned_line:
+            target_segments.append(cleaned_line)
+            
+    # นำข้อความมารวมกันโดยคั่นด้วยช่องว่าง เพื่อให้ Regex ทำงานได้ครอบคลุมทุกรูปแบบ
+    normalized_text = " ".join(target_segments)
+
+    # Regex: ชื่อภาษาไทย/อังกฤษ (ไม่รวมตัวเลข) ตามด้วยตัวเลขราคา (เว้นวรรคหรือไม่เว้นวรรคก็ได้)
+    pattern = r'([ก-๙a-zA-Z\s]+?)\s*(\d+(?:\.\d+)?)(?:\s*บาท)?(?=\s+[ก-๙a-zA-Z]|\s*$)'
+    matches = re.findall(pattern, normalized_text)
+    
+    if not matches:
         return None
 
     transactions = []
-    remaining_text = text.strip()
-    cache_items = sorted(cache_dict.keys(), key=len, reverse=True)
 
-    while remaining_text:
-        found_item = False
-        for cache_key in cache_items:
-            pattern = rf'(?<!\S){re.escape(cache_key)}\s+(\d+(?:\.\d+)?)(?:\s*บาท)?(?=\s|$)'
-            match = re.search(pattern, remaining_text, flags=re.IGNORECASE)
+    for item_name, price_str in matches:
+        clean_name = item_name.strip()
+        if not clean_name:
+            continue
+            
+        price = float(price_str)
+        cache_key = clean_name.lower()
 
-            if not match:
-                continue
-
+        # ตรวจสอบว่ามีประวัติใน RAM Cache หรือไม่
+        if cache_dict and cache_key in cache_dict:
             cached_info = cache_dict[cache_key]
-            price = float(match.group(1))
-
-            clean_name = remaining_text[match.start():match.start() + len(match.group(0))]
-            clean_name = re.sub(r'\s*\d+(?:\.\d+)?\s*(?:บาท)?$', '', clean_name).strip()
-
             transactions.append({
                 "item_name": clean_name,
                 "quantity": 1,
                 "total_price": price,
-                "transaction_type": cached_info["transaction_type"],
-                "category": cached_info["category"]
+                "transaction_type": cached_info.get("transaction_type", "รายจ่าย"),
+                "category": cached_info.get("category", "ค่าอาหาร")
             })
-
-            remaining_text = (remaining_text[:match.start()] + remaining_text[match.end():]).strip()
-            found_item = True
-            break
-
-        if not found_item:
-            return None
+        else:
+            # Fallback ทันทีหากเป็นคำใหม่ ไม่ต้องเสียเวลายิงหา AI
+            transactions.append({
+                "item_name": clean_name,
+                "quantity": 1,
+                "total_price": price,
+                "transaction_type": "รายจ่าย",
+                "category": "ค่าสินค้า"
+            })
 
     return {"transactions": transactions} if transactions else None
 
@@ -314,7 +332,7 @@ async def process_transaction_ui(channel, message, parsed_data, mode, used_ai):
     for item in parsed_data["transactions"]:
         summary += f"• `{item['item_name']}` | {item['quantity']}x | **{item['total_price']}฿**\n"
     
-    source_tag = "🧠 `[AI]`" if used_ai else "⚡ `[RAM]`"
+    source_tag = "🤖 `[AI]`" if used_ai else "⚡ `[RAM]`"
     final_msg = f"{summary.strip()}\n{source_tag}"
     
     view = ApproveView(message.id, message.content, parsed_data, mode=mode)
