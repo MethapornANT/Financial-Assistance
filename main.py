@@ -3,6 +3,7 @@ import io
 import re
 import sys
 import json
+import asyncio
 import pandas as pd
 import traceback
 import discord
@@ -317,38 +318,52 @@ class ApproveView(discord.ui.View):
 
     @discord.ui.button(label="✅", style=discord.ButtonStyle.success)
     async def approve_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != ALLOWED_USER_ID: return
+        if interaction.user.id != ALLOWED_USER_ID: 
+            return
         
-        for idx, item in enumerate(self.parsed_data["transactions"]):
-            sub_id = f"{self.msg_id}_{idx}" if len(self.parsed_data["transactions"]) > 1 else self.msg_id
-            insert_transaction(sub_id, self.raw_text, item)
+        try:
+            # 1. บันทึกรายการลง Supabase
+            for idx, item in enumerate(self.parsed_data["transactions"]):
+                sub_id = f"{self.msg_id}_{idx}" if len(self.parsed_data["transactions"]) > 1 else self.msg_id
+                insert_transaction(sub_id, self.raw_text, item)
 
-        # คำนวณยอดรวมรายจ่ายเดือนนี้เทียบกับงบประมาณ
-        budget = get_user_budget(interaction.user.id)
-        today = datetime.now()
-        start_month = f"{today.year}-{today.month:02d}-01T00:00:00"
-        res = supabase.table("transactions").select("total_price, transaction_type").gte("created_at", start_month).execute()
-        
-        total_expense = sum(float(x.get("total_price", 0)) for x in (res.data or []) if x.get("transaction_type") != "รายรับ")
-        percent_used = (total_expense / budget) * 100 if budget > 0 else 0
-        remaining = budget - total_expense
+            # 2. คำนวณยอดเงินรวมและยอดของรายการปัจจุบัน
+            budget = get_user_budget(interaction.user.id)
+            today = datetime.now()
+            start_month = f"{today.year}-{today.month:02d}-01T00:00:00"
+            res = supabase.table("transactions").select("total_price, transaction_type").gte("created_at", start_month).execute()
+            
+            total_expense = sum(float(x.get("total_price", 0)) for x in (res.data or []) if x.get("transaction_type") != "รายรับ")
+            current_tx_total = sum(float(x.get("total_price", 0)) for x in self.parsed_data["transactions"] if x.get("transaction_type") != "รายรับ")
+            
+            # คำนวณ % ก่อนหน้า และ % ปัจจุบัน
+            old_expense = total_expense - current_tx_total
+            old_pct = (old_expense / budget) * 100 if budget > 0 else 0
+            new_pct = (total_expense / budget) * 100 if budget > 0 else 0
+            remaining = budget - total_expense
 
-        warning_tag = ""
-        if percent_used >= 100:
-            warning_tag = f"\n🚨 **เตือนสติ:** ใช้เงินเกินงบแล้ว! ({total_expense:,.2f}/{budget:,.2f} ฿)"
-        elif percent_used >= 90:
-            warning_tag = f"\n⚠️ **เตือนระดับวิกฤต:** ใช้ไปแล้ว {percent_used:.1f}% เหลือเงินอีกแค่ {remaining:,.2f} ฿"
-        elif percent_used >= 80:
-            warning_tag = f"\n⚠️ **เตือน:** ใช้ไปแล้ว {percent_used:.1f}% ใกล้ถึงเพดานงบแล้ว"
-        elif percent_used >= 50:
-            warning_tag = f"\n⚡ **แจ้งเตือน:** ใช้เงินแตะครึ่งทาง (50%) ของงบแล้ว ({total_expense:,.2f}/{budget:,.2f} ฿)"
+            # 3. แจ้งเตือนเฉพาะ "จังหวะแรกที่ข้ามเส้นเกณฑ์" เท่านั้น (ไม่ส่งซ้ำซาก)
+            warning_tag = ""
+            if old_pct < 100 and new_pct >= 100:
+                warning_tag = f"\n🚨 **เตือนสติ:** ใช้เงินเกินงบแล้ว! ({total_expense:,.2f}/{budget:,.2f} ฿)"
+            elif old_pct < 90 and new_pct >= 90:
+                warning_tag = f"\n⚠️ **เตือนวิกฤต:** ใช้ไปแล้ว {new_pct:.1f}% เหลืออีก {remaining:,.2f} ฿"
+            elif old_pct < 80 and new_pct >= 80:
+                warning_tag = f"\n⚠️ **เตือน:** ใช้ไปแล้ว {new_pct:.1f}% ใกล้ถึงเพดานงบแล้ว"
+            elif old_pct < 50 and new_pct >= 50:
+                warning_tag = f"\n⚡ **แจ้งเตือน:** ใช้เงินแตะครึ่งทาง (50%) แล้ว ({total_expense:,.2f}/{budget:,.2f} ฿)"
 
-        status_text = "✅ **บันทึกแล้ว**" if self.mode == "insert" else "🔄 **อัปเดตเรียบร้อย**"
-        await interaction.response.edit_message(content=f"{status_text}{warning_tag}", view=None)
+            status_text = "✅ **บันทึกแล้ว**" if self.mode == "insert" else "🔄 **อัปเดตเรียบร้อย**"
+            await interaction.response.edit_message(content=f"{status_text}{warning_tag}", view=None)
+
+        except Exception as e:
+            traceback.print_exc()
+            await interaction.response.send_message("❌ บันทึกข้อมูลไม่สำเร็จ กรุณาลองใหม่อีกครั้ง", ephemeral=True)
 
     @discord.ui.button(label="❌", style=discord.ButtonStyle.danger)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != ALLOWED_USER_ID: return
+        if interaction.user.id != ALLOWED_USER_ID: 
+            return
         await interaction.response.edit_message(content="❌ **ยกเลิก**", view=None)
 
 class QuickActionView(discord.ui.View):
@@ -371,21 +386,37 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+async def parse_intent_with_retry(text: str, max_retries: int = 2) -> dict:
+    for attempt in range(max_retries + 1):
+        try:
+            return await parse_intent(text)
+        except Exception as e:
+            err_str = str(e).lower()
+            # ตรวจจับ error 503 / unavailable เพื่อวนลองใหม่
+            if ("503" in err_str or "unavailable" in err_str) and attempt < max_retries:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise e
+        
 async def send_clean_error(channel, error_obj):
     print("\n" + "="*50, flush=True)
-    print("[SYS_ERR] เกิดข้อผิดพลาด:", flush=True)
     traceback.print_exc()
     print("="*50 + "\n", flush=True)
 
     err = str(error_obj).lower()
+
     if "429" in err or "resource_exhausted" in err:
-        await channel.send("⏳ โควตา AI รายวันเต็มแล้ว")
+        await channel.send("⏳ โควตา AI เต็มชั่วคราว กรุณารอสักครู่")
+    elif "503" in err or "unavailable" in err or "high demand" in err:
+        await channel.send("⚠️ เซิร์ฟเวอร์ AI กำลังโหลดหนัก กรุณาลองใหม่")
     elif "invalid json" in err or "json" in err:
-        await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง")
-    elif "not found" in err or "404" in err:
-        await channel.send("❌ ไม่พบโมเดล AI ที่ระบุ")
+        await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง กรุณาระบุรายการและราคาใหม่")
+    elif any(kw in err for kw in ["timeout", "connect", "connection", "aiohttp"]):
+        await channel.send("🌐 การเชื่อมต่อขัดข้อง กรุณาลองใหม่อีกครั้ง")
+    elif any(kw in err for kw in ["postgrest", "supabase", "database"]):
+        await channel.send("🗄️ ฐานข้อมูลขัดข้อง ไม่สามารถทำรายการได้")
     else:
-        await channel.send(f"❌ ระบบขัดข้อง: {str(error_obj)[:60]}")
+        await channel.send("❌ ระบบขัดข้อง ไม่สามารถประมวลผลได้")
 
 async def process_transaction_ui(channel, message, parsed_data, mode, used_ai):
     """ส่งสรุปรายการให้ผู้ใช้กด Approve / Cancel"""
@@ -467,34 +498,40 @@ async def process_query_ui(channel, message, db_buffer: list):
         await send_clean_error(channel, e)
 
 async def handle_incoming_message(channel, message, mode="insert"):
-    """ตัวจัดการ Router กลาง: แยกงานระหว่าง RAM Cache และ AI Engine"""
     async with channel.typing():
         try:
-            # 1. เช็กความจำ RAM Cache ก่อน (0 Token)
+            # 1. เช็ก Cache ใน RAM ก่อน (ถ้าเจอ แปลว่าเป็น Transaction ชัวร์ 0 Token)
             parsed_data = extract_multiple_items(message.content, ITEM_CACHE)
             if parsed_data:
                 await process_transaction_ui(channel, message, parsed_data, mode, used_ai=False)
                 return
 
-            # 2. ส่งข้อความให้ AI ตีความเจตนา
-            intent_data = await parse_intent(message.content)
+            # 2. ถ้าหลุด Cache ส่งให้ AI พร้อมระบบ Retry
+            intent_data = await parse_intent_with_retry(message.content)
+
+            # 3. แยกสายการทำงานตาม Intent ที่ AI ตอบกลับมาจริง
             action = intent_data.get("action")
-
-            if action == "set_budget":
-                # จัดการการตั้งงบประมาณ
-                new_budget = float(intent_data.get("budget_amount") or 0)
-                if new_budget > 0:
-                    set_user_budget(message.author.id, new_budget)
-                    await message.reply(f"🎯 **ตั้งงบประมาณรายเดือนสำเร็จ:** `{new_budget:,.2f} บาท`\nระบบจะคอยแจ้งเตือนเมื่อใช้เงินแตะ 50%, 80%, 90% และ 100%")
-                else:
-                    await message.reply("❌ กรุณาระบุจำนวนเงินงบประมาณที่ถูกต้อง")
-
-            elif action == "query":
+            
+            if action == "query":
+                # 🟢 แก้จุดที่ 1: เปลี่ยนมาเรียก get_buffer_data() ที่ประกาศไว้ในส่วนที่ 2
                 db_buffer = get_buffer_data()
                 await process_query_ui(channel, message, db_buffer)
 
+            elif action == "set_budget":
+                budget_amount = intent_data.get("budget_amount")
+                if budget_amount:
+                    # 🟢 แก้จุดที่ 2: เรียก set_user_budget เพื่อบันทึกลง Database จริง
+                    set_user_budget(message.author.id, float(budget_amount))
+                    await channel.send(f"🎯 ตั้งงบประมาณเรียบร้อย: {float(budget_amount):,.2f} บาท")
+                else:
+                    await channel.send("❌ ไม่สามารถระบุตัวเลขงบประมาณได้ กรุณาลองใหม่อีกครั้ง")
+
             else:
+                # บันทึกเป็น Transaction เฉพาะเมื่อ AI ยืนยันว่าเป็น Transaction จริงๆ
                 parsed_data = {"transactions": intent_data.get("transactions", [])}
+                if not parsed_data["transactions"]:
+                    return
+
                 for item in parsed_data["transactions"]:
                     name = item.get("item_name", "").strip().lower()
                     if name:
@@ -503,6 +540,7 @@ async def handle_incoming_message(channel, message, mode="insert"):
                             "transaction_type": item.get("transaction_type", "รายจ่าย")
                         }
                 await process_transaction_ui(channel, message, parsed_data, mode, used_ai=True)
+
         except Exception as e:
             await send_clean_error(channel, e)
 
