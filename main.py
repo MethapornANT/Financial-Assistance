@@ -55,13 +55,12 @@ ALLOWED_USER_ID = int(os.getenv("DISCORD_ALLOWED_USER_ID", 0))
 SALARY_AMOUNT = float(os.getenv("SALARY_AMOUNT", 30000))
 SALARY_PAY_DAY = int(os.getenv("SALARY_PAY_DAY", 25))
 
-# ล็อกโมเดลเป็น gemini-3.5-flash-lite ตลอดทั้งระบบ
 MODEL_NAME = 'gemini-3.5-flash-lite'
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Global In-Memory Cache สำหรับเก็บคำศัพท์
+# Global In-Memory Cache สำหรับเก็บคำศัพท์ (0 Token)
 ITEM_CACHE = {}
 
 
@@ -87,19 +86,13 @@ def delete_transaction(msg_id: str):
     """ลบรายการออกจาก Supabase"""
     supabase.table("transactions").delete().eq("discord_msg_id", msg_id).execute()
 
-def get_buffer_data():
-    """ดึงข้อมูล 90 วันล่าสุดเป็น RAM Buffer เพื่อความรวดเร็วในการตอบคำถามทั่วไป"""
-    today = datetime.now()
-    start_date = (today - timedelta(days=90)).strftime("%Y-%m-%d")
-    response = supabase.table("transactions").select("*").gte("created_at", f"{start_date} 00:00:00").execute()
-    return response.data or []
-
 def fetch_transactions_by_range(start_date: str = None, end_date: str = None):
+    """ดึงข้อมูลสดจาก Supabase ตามช่วงวันที่กำหนด"""
     query = supabase.table("transactions").select("*").order("created_at", desc=False)
     if start_date:
-        query = query.gte("created_at", f"{start_date}T00:00:00")
+        query = query.gte("created_at", f"{start_date} 00:00:00")
     if end_date:
-        query = query.lte("created_at", f"{end_date}T23:59:59")
+        query = query.lte("created_at", f"{end_date} 23:59:59")
     response = query.execute()
     return response.data or []
 
@@ -122,7 +115,7 @@ def load_item_cache_to_memory():
         print(f"[ERR] Cache load failed: {e}")
 
 def get_user_budget(user_id: int) -> float:
-    """ดึงงบประมาณรายเดือนของผู้ใช้ ถ้ายังไม่เคยตั้งจะใช้ SALARY_AMOUNT เป็นค่าเริ่มต้น"""
+    """ดึงงบประมาณรายเดือนของผู้ใช้"""
     try:
         res = supabase.table("user_settings").select("monthly_budget").eq("discord_user_id", user_id).execute()
         if res.data and len(res.data) > 0:
@@ -139,15 +132,15 @@ def set_user_budget(user_id: int, budget: float):
     }
     supabase.table("user_settings").upsert(record, on_conflict="discord_user_id").execute()
 
+
 # ==========================================
 # 3. AI ENGINE & SMART PARSER
 # ==========================================
 def extract_multiple_items(text: str, cache_dict: dict):
+    """ดึงรายการสินค้าจาก RAM Cache โดยตรง ไม่เสีย Token"""
     if not text:
         return None
 
-    # [แก้บั๊ก ReDoS] ปรับ Regex ให้ทำงานแบบเส้นตรง
-    # ป้องกันอาการ CPU ค้าง 100% เวลาพิมพ์ประโยคคำถามที่ไม่มีตัวเลข
     pattern = r'([ก-๙a-zA-Z][ก-๙a-zA-Z0-9\s-]*?)\s+(\d+(?:\.\d+)?)(?:\s*บาท)?'
     matches = re.findall(pattern, text)
     
@@ -174,28 +167,27 @@ def extract_multiple_items(text: str, cache_dict: dict):
     return {"transactions": transactions} if transactions else None
 
 async def parse_intent(text: str) -> dict:
-    """[Unified Intent Parser] แยกแยะว่าเป็นการบันทึก, สอบถาม หรือตั้งค่างบประมาณ"""
+    """วิเคราะห์เจตนาข้อความ: transaction, query หรือ set_budget"""
     prompt = f"""วิเคราะห์ข้อความ: "{text}"
-    แยกแยะเจตนาของผู้ใช้เป็น 1 ใน 3 รูปแบบ:
-    1. "set_budget" (ต้องการตั้งเป้า/กำหนดงบ/เพดานเงิน เช่น 'ตั้งงบเดือนนี้ 4000', 'ห้ามใช้เงินเกิน 5000')
-    2. "query" (ถามยอดเงิน, สรุปรายรับรายจ่าย, ถามงบที่เหลือ, ถามวันที่เหลือ)
-    3. "transaction" (บันทึกรายรับ/รายจ่ายทั่วไป)
+แยกแยะเจตนาของผู้ใช้เป็น 1 ใน 3 รูปแบบ:
+1. "set_budget" (ต้องการตั้งเป้า/กำหนดงบ/เพดานเงิน เช่น 'ตั้งงบเดือนนี้ 4000', 'ห้ามใช้เงินเกิน 5000')
+2. "query" (ถามยอดเงิน, สรุปรายรับรายจ่าย, ถามงบที่เหลือ, ถามวันที่เหลือ, ถามภาพรวม)
+3. "transaction" (บันทึกรายรับ/รายจ่ายทั่วไป เช่น 'ข้าวมันไก่ 50', 'เงินเดือนเข้า 30000')
 
-    ตอบเป็น JSON เท่านั้น:
-    {{
-        "action": "transaction" | "query" | "set_budget",
-        "budget_amount": ตัวเลขงบประมาณ (ใส่เฉพาะเมื่อ action เป็น set_budget นอกนั้นใส่ null),
-        "transactions": [
-            {{
-                "item_name": "ชื่อรายการสั้นๆ",
-                "quantity": 1,
-                "total_price": 0,
-                "transaction_type": "รายรับ" หรือ "รายจ่าย",
-                "category": "ค่าอาหาร" | "ค่าบริการ" | "ค่าสินค้า" | "รายได้" | "เงินเดือน"
-            }}
-        ]
-    }}
-    """
+ตอบเป็น JSON เท่านั้น:
+{{
+    "action": "transaction" | "query" | "set_budget",
+    "budget_amount": ตัวเลขงบประมาณ (ใส่เฉพาะเมื่อ action เป็น set_budget นอกนั้นใส่ null),
+    "transactions": [
+        {{
+            "item_name": "ชื่อรายการสั้นๆ",
+            "quantity": 1,
+            "total_price": 0,
+            "transaction_type": "รายรับ" หรือ "รายจ่าย",
+            "category": "ค่าอาหาร" | "ค่าบริการ" | "ค่าสินค้า" | "รายได้" | "เงินเดือน"
+        }}
+    ]
+}}"""
     response = await ai_client.aio.models.generate_content(
         model=MODEL_NAME,
         contents=prompt,
@@ -207,30 +199,44 @@ async def parse_intent(text: str) -> dict:
         return json.loads(raw_text[start_idx:end_idx])
     raise ValueError("Invalid JSON from parse_intent")
 
+async def parse_intent_with_retry(text: str, max_retries: int = 2) -> dict:
+    """ระบบ Auto-Retry เมื่อ AI เกิด Error 503 หรือ High Demand ชั่วคราว"""
+    for attempt in range(max_retries + 1):
+        try:
+            return await parse_intent(text)
+        except Exception as e:
+            err_str = str(e).lower()
+            if ("503" in err_str or "unavailable" in err_str or "high demand" in err_str) and attempt < max_retries:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise e
+
 async def analyze_query_parameters(question: str) -> dict:
+    """สกัดช่วงเวลา start_date และ end_date จากคำถามของผู้ใช้"""
     today = datetime.now()
     today_str = today.strftime('%Y-%m-%d')
     first_day_this_month = today.strftime('%Y-%m-01')
+    first_day_2_months_ago = (today.replace(day=1) - timedelta(days=60)).strftime('%Y-%m-01')
+    yesterday_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
 
-    prompt = f"""
-    คำถาม: "{question}"
-    วันที่ปัจจุบันของระบบ: {today_str}
-    วันแรกของเดือนปัจจุบัน: {first_day_this_month}
+    prompt = f"""คำถาม: "{question}"
+วันที่ปัจจุบัน: {today_str}
+วันแรกของเดือนนี้: {first_day_this_month}
+วันแรกของ 2 เดือนที่แล้ว: {first_day_2_months_ago}
 
-    หน้าที่:
-    แปลงช่วงเวลาที่ผู้ใช้ถามเป็น start_date และ end_date (รูปแบบ YYYY-MM-DD):
-    - 'ตอนนี้', 'เดือนนี้', 'ปัจจุบัน', 'เหลืองบเท่าไร', 'เหลืออีกกี่วัน': start_date คือ {first_day_this_month} และ end_date คือ {today_str}
-    - 'เดือนที่แล้ว': วันแรกและวันสุดท้ายของเดือนก่อนหน้า (เช่น ปัจจุบันเดือน 8 ให้เป็น 2026-07-01 ถึง 2026-07-31)
-    - 'เมื่อวาน': วันเดียวกันทั้ง start และ end
-    - 'วันนี้': {today_str} ทั้ง start และ end
-    - ถ้าถามภาพรวมโดยไม่ระบุเวลา: ให้ start_date เป็น {first_day_this_month} และ end_date เป็น {today_str}
+หน้าที่: สกัดช่วงเวลา start_date และ end_date (รูปแบบ YYYY-MM-DD):
+- '2 เดือนที่ผ่านมา', '2 เดือนย้อนหลัง': start_date คือ {first_day_2_months_ago}, end_date คือ {today_str}
+- 'เดือนที่แล้ว': วันแรกและวันสุดท้ายของเดือนก่อนหน้า (เช่น 2026-07-01 ถึง 2026-07-31)
+- 'เดือนนี้', 'ตอนนี้', 'ปัจจุบัน', 'งบเหลือเท่าไร', 'เหลืออีกกี่วัน': start_date คือ {first_day_this_month}, end_date คือ {today_str}
+- 'วันนี้': start_date คือ {today_str}, end_date คือ {today_str}
+- 'เมื่อวาน': start_date คือ {yesterday_str}, end_date คือ {yesterday_str}
+- ถ้าไม่ระบุเวลา: start_date คือ {first_day_this_month}, end_date คือ {today_str}
 
-    ตอบเป็น JSON เท่านั้น:
-    {{
-        "start_date": "YYYY-MM-DD",
-        "end_date": "YYYY-MM-DD"
-    }}
-    """
+ตอบเป็น JSON เท่านั้น:
+{{
+    "start_date": "YYYY-MM-DD",
+    "end_date": "YYYY-MM-DD"
+}}"""
     response = await ai_client.aio.models.generate_content(
         model=MODEL_NAME,
         contents=prompt,
@@ -243,12 +249,11 @@ async def analyze_query_parameters(question: str) -> dict:
     return {"start_date": first_day_this_month, "end_date": today_str}
 
 async def generate_query_summary(question: str, final_data: list, user_id: int = ALLOWED_USER_ID) -> str:
-    """[Summary Generator] ตอบตรงคำถาม สั้นกระชับ ไม่พ่นข้อมูลส่วนเกินที่ไม่ได้ถาม"""
+    """คำนวณตัวเลขทางคณิตศาสตร์ให้เสร็จสมบูรณ์ก่อนส่งให้ AI สรุปเป็นภาษาไทย"""
     if not final_data:
         return "ไม่พบข้อมูลรายการในช่วงเวลาดังกล่าวครับ"
 
     today = datetime.now()
-    # คำนวณวันสุดท้ายของเดือนปัจจุบัน และวันที่เหลือ
     next_month = today.replace(day=28) + timedelta(days=4)
     last_day_of_month = (next_month - timedelta(days=next_month.day)).day
     days_left = max(0, last_day_of_month - today.day)
@@ -260,43 +265,46 @@ async def generate_query_summary(question: str, final_data: list, user_id: int =
     total_income = 0.0
 
     for row in final_data:
-        cat = row.get("หมวดหมู่") or "ค่าสินค้า"
+        cat = row.get("หมวดหมู่") or row.get("category") or "ค่าสินค้า"
         price = float(row.get("ราคา") or row.get("total_price") or 0)
         t_type = row.get("ประเภท") or row.get("transaction_type") or "รายจ่าย"
 
-        cat_summary[cat] = cat_summary.get(cat, 0.0) + price
         if t_type == "รายรับ" or cat in ["เงินเดือน", "รายได้"]:
             total_income += price
         else:
             total_expense += price
+            cat_summary[cat] = cat_summary.get(cat, 0.0) + price
 
+    diff = total_income - total_expense
     remaining_budget = budget - total_expense
     daily_budget_left = (remaining_budget / days_left) if days_left > 0 and remaining_budget > 0 else 0
 
     summary_payload = {
-        "วันที่ปัจจุบัน": today.strftime('%Y-%m-%d'),
-        "จำนวนวันที่เหลือในเดือนนี้": f"{days_left} วัน",
-        "เพดานงบประมาณ": f"{budget:,.2f} บาท",
-        "ใช้ไปแล้ว": f"{total_expense:,.2f} บาท",
-        "งบที่เหลือ": f"{remaining_budget:,.2f} บาท",
-        "เฉลี่ยใช้วันละ": f"{daily_budget_left:,.2f} บาท",
-        "รายรับทั้งหมด": f"{total_income:,.2f} บาท",
-        "ยอดแยกตามหมวดหมู่": cat_summary
+        "สรุปยอดคำนวณจริงจากระบบ": {
+            "รวมรายจ่าย": f"{total_expense:,.2f} บาท",
+            "รวมรายรับ": f"{total_income:,.2f} บาท",
+            "ส่วนต่างคงเหลือ (รายรับ-รายจ่าย)": f"{diff:,.2f} บาท",
+            "สถานะการเงิน": "รายจ่ายเกินรายรับ" if total_expense > total_income else "ไม่เกินรายรับ (มีเงินเก็บ)",
+            "ยอดแยกตามหมวดหมู่": {k: f"{v:,.2f} บาท" for k, v in cat_summary.items()}
+        },
+        "สถานะงบประมาณเดือนนี้": {
+            "เพดานงบประมาณ": f"{budget:,.2f} บาท",
+            "ใช้ไปแล้ว": f"{total_expense:,.2f} บาท",
+            "งบที่เหลือ": f"{remaining_budget:,.2f} บาท",
+            "จำนวนวันที่เหลือในเดือนนี้": f"{days_left} วัน",
+            "งบเฉลี่ยใช้ได้ต่อวัน": f"{daily_budget_left:,.2f} บาท"
+        }
     }
 
-    summary_prompt = f"""
-    คำถามของผู้ใช้: "{question}"
-    ข้อมูลการเงิน: {json.dumps(summary_payload, ensure_ascii=False)}
+    summary_prompt = f"""คำถามของผู้ใช้: "{question}"
+ข้อมูลตัวเลขจริงที่คำนวณแล้ว:
+{json.dumps(summary_payload, ensure_ascii=False, indent=2)}
 
-    กฎการตอบ:
-    1. ตอบเฉพาะสิ่งที่คำถามต้องการรู้โดยตรงเท่านั้น สั้นกระชับ (1-3 บรรทัด)
-    2. ห้ามแถมข้อมูลที่ผู้ใช้ไม่ได้ถาม (เช่น ถ้าไม่ได้ถามหารายรับ หรือไม่ได้ขอแยกหมวดหมู่ ห้ามใส่มาเด็ดขาด)
-    3. ตัวอย่างการตอบ:
-       - ถ้าถาม 'ใช้ไปเท่าไร เหลืออีกกี่วัน':
-         "💸 **ใช้ไปแล้ว:** 10,397.00 / 8,000.00 บาท (เกินงบ 2,397.00 บาท)
-         📅 **เหลือเวลาอีก:** 5 วัน (งบเฉลี่ยคงเหลือ 0.00 บาท/วัน)"
-    4. ห้ามสร้างตาราง (Markdown Table) เด็ดขาด
-    """
+กฎการตอบ:
+1. ตอบเฉพาะสิ่งที่ผู้ใช้ถามโดยตรง สั้นกระชับ (1-3 บรรทัด)
+2. ห้ามคิดเลขหรือประเมินยอดใหม่เด็ดขาด ให้ดึงตัวเลขจากข้อมูลด้านบนไปตอบเท่านั้น
+3. ถ้าถามเปรียบเทียบรายรับ vs รายจ่าย ให้บอก รวมรายจ่าย, รวมรายรับ, ส่วนต่าง และสรุปว่าเกินหรือไม่ชัดเจน
+4. ห้ามสร้างตาราง Markdown เด็ดขาด"""
 
     summary_res = await ai_client.aio.models.generate_content(
         model=MODEL_NAME,
@@ -304,6 +312,7 @@ async def generate_query_summary(question: str, final_data: list, user_id: int =
         config=types.GenerateContentConfig(temperature=0.0)
     )
     return summary_res.text.strip()
+
 
 # ==========================================
 # 4. DISCORD UI COMPONENTS
@@ -330,13 +339,13 @@ class ApproveView(discord.ui.View):
             # 2. คำนวณยอดเงินรวมและยอดของรายการปัจจุบัน
             budget = get_user_budget(interaction.user.id)
             today = datetime.now()
-            start_month = f"{today.year}-{today.month:02d}-01T00:00:00"
+            start_month = f"{today.year}-{today.month:02d}-01 00:00:00"
             res = supabase.table("transactions").select("total_price, transaction_type").gte("created_at", start_month).execute()
             
             total_expense = sum(float(x.get("total_price", 0)) for x in (res.data or []) if x.get("transaction_type") != "รายรับ")
             current_tx_total = sum(float(x.get("total_price", 0)) for x in self.parsed_data["transactions"] if x.get("transaction_type") != "รายรับ")
             
-            # คำนวณ % ก่อนหน้า และ % ปัจจุบัน
+            # เปรียบเทียบ % ก่อนและหลังบันทึก
             old_expense = total_expense - current_tx_total
             old_pct = (old_expense / budget) * 100 if budget > 0 else 0
             new_pct = (total_expense / budget) * 100 if budget > 0 else 0
@@ -372,7 +381,8 @@ class QuickActionView(discord.ui.View):
 
     @discord.ui.button(label="☕ กาแฟ 50฿", style=discord.ButtonStyle.primary)
     async def coffee_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != ALLOWED_USER_ID: return
+        if interaction.user.id != ALLOWED_USER_ID: 
+            return
         msg_id = f"qa_{interaction.message.id}_{datetime.now().timestamp()}"
         data = {"item_name": "กาแฟ", "quantity": 1, "total_price": 50, "transaction_type": "รายจ่าย", "category": "ค่าอาหาร"}
         insert_transaction(msg_id, "Quick-Coffee", data)
@@ -386,19 +396,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-async def parse_intent_with_retry(text: str, max_retries: int = 2) -> dict:
-    for attempt in range(max_retries + 1):
-        try:
-            return await parse_intent(text)
-        except Exception as e:
-            err_str = str(e).lower()
-            # ตรวจจับ error 503 / unavailable เพื่อวนลองใหม่
-            if ("503" in err_str or "unavailable" in err_str) and attempt < max_retries:
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
-            raise e
-        
 async def send_clean_error(channel, error_obj):
+    """ส่ง Error สั้น กระชับ ตรงประเด็นเข้า Discord และแสดง Full Traceback ใน Terminal"""
     print("\n" + "="*50, flush=True)
     traceback.print_exc()
     print("="*50 + "\n", flush=True)
@@ -408,9 +407,9 @@ async def send_clean_error(channel, error_obj):
     if "429" in err or "resource_exhausted" in err:
         await channel.send("⏳ โควตา AI เต็มชั่วคราว กรุณารอสักครู่")
     elif "503" in err or "unavailable" in err or "high demand" in err:
-        await channel.send("⚠️ เซิร์ฟเวอร์ AI กำลังโหลดหนัก กรุณาลองใหม่")
+        await channel.send("⚠️ เซิร์ฟเวอร์ AI กำลังโหลดหนัก กรุณาลองใหม่อีกครั้ง")
     elif "invalid json" in err or "json" in err:
-        await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง กรุณาระบุรายการและราคาใหม่")
+        await channel.send("❌ รูปแบบข้อมูลไม่ถูกต้อง กรุณาระบุใหม่อีกครั้ง")
     elif any(kw in err for kw in ["timeout", "connect", "connection", "aiohttp"]):
         await channel.send("🌐 การเชื่อมต่อขัดข้อง กรุณาลองใหม่อีกครั้ง")
     elif any(kw in err for kw in ["postgrest", "supabase", "database"]):
@@ -428,42 +427,28 @@ async def process_transaction_ui(channel, message, parsed_data, mode, used_ai):
     view = ApproveView(message.id, message.content, parsed_data, mode=mode)
     await message.reply(final_msg, view=view)
 
-async def process_query_ui(channel, message, db_buffer: list):
+async def process_query_ui(channel, message):
+    """ประมวลผลคำถามและรายงานสรุป ดึงข้อมูลสดจาก Supabase 100%"""
     try:
-        # 1. สกัดช่วงวันที่
+        # 1. ให้ AI สกัดช่วงวันที่จากคำถาม
         analysis = await analyze_query_parameters(message.content)
         start_date = analysis.get("start_date")
         end_date = analysis.get("end_date")
 
-        buffer_start = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-
-        # 2. เลือกว่าจะดึงจาก RAM Buffer หรือยิง Supabase
-        if start_date and start_date >= buffer_start and db_buffer:
-            final_data = db_buffer
-            if start_date:
-                final_data = [x for x in final_data if str(x.get("created_at", ""))[:10] >= start_date]
-            if end_date:
-                final_data = [x for x in final_data if str(x.get("created_at", ""))[:10] <= end_date]
-        else:
-            final_data = fetch_transactions_by_range(start_date, end_date)
+        # 2. ยิงดึงข้อมูลสดจาก Supabase ทันที ข้อมูลสดใหม่ตรงกับความจริง 100%
+        final_data = fetch_transactions_by_range(start_date, end_date)
 
         if not final_data:
             await message.reply("ไม่พบข้อมูลรายการในช่วงเวลาดังกล่าวครับ")
             return
 
-        # 3. ส่งเฉพาะฟิลด์ที่จำเป็นเข้า AI เพื่อลดขนาด Payload
-        payload_for_ai = [
-            {"รายการ": x.get("item_name"), "หมวดหมู่": x.get("category"), "ราคา": x.get("total_price"), "ประเภท": x.get("transaction_type")}
-            for x in final_data
-        ]
+        # 3. คำนวณและสรุปคำตอบ
+        summary_text = await generate_query_summary(message.content, final_data, user_id=message.author.id)
 
-        summary_text = await generate_query_summary(message.content, payload_for_ai, user_id=message.author.id)
-
-        # 4. ป้องกันข้อความยาวเกินขีดจำกัดของ Discord
         if len(summary_text) > 1900:
             summary_text = summary_text[:1900] + "\n...(ข้อมูลยาวเกินกำหนด พิมพ์ขอเป็นไฟล์ Excel เพื่อดูครบทุกรายการ)"
 
-        # 5. จัดการไฟล์ Excel (กรณีผู้ใช้พิมพ์ขอไฟล์)
+        # 4. จัดการไฟล์ Excel กรณีผู้ใช้ขอ
         file_keywords = ['ไฟล์', 'excel', 'รายงาน', 'export', 'ชีต']
         wants_file = any(kw in message.content.lower() for kw in file_keywords)
 
@@ -483,13 +468,7 @@ async def process_query_ui(channel, message, db_buffer: list):
                 df.to_excel(writer, index=False, sheet_name='Summary')
             buffer.seek(0)
 
-            if start_date and end_date and start_date != end_date:
-                file_name = f"Report_{start_date.replace('-', '_')}_to_{end_date.replace('-', '_')}.xlsx"
-            elif start_date:
-                file_name = f"Report_{start_date.replace('-', '_')}.xlsx"
-            else:
-                file_name = f"Report_Summary_{datetime.now().strftime('%Y_%m_%d')}.xlsx"
-
+            file_name = f"Report_{start_date}_to_{end_date}.xlsx" if start_date and end_date else "Report_Summary.xlsx"
             await message.reply(summary_text, file=discord.File(fp=buffer, filename=file_name))
         else:
             await message.reply(summary_text)
@@ -500,34 +479,29 @@ async def process_query_ui(channel, message, db_buffer: list):
 async def handle_incoming_message(channel, message, mode="insert"):
     async with channel.typing():
         try:
-            # 1. เช็ก Cache ใน RAM ก่อน (ถ้าเจอ แปลว่าเป็น Transaction ชัวร์ 0 Token)
+            # 1. เช็ก Cache ใน RAM ก่อน (ถ้าเจอ แปลว่าเป็น Transaction แน่นอน 0 Token)
             parsed_data = extract_multiple_items(message.content, ITEM_CACHE)
             if parsed_data:
                 await process_transaction_ui(channel, message, parsed_data, mode, used_ai=False)
                 return
 
-            # 2. ถ้าหลุด Cache ส่งให้ AI พร้อมระบบ Retry
+            # 2. ส่ง AI วิเคราะห์ Intent พร้อมระบบ Auto-Retry
             intent_data = await parse_intent_with_retry(message.content)
-
-            # 3. แยกสายการทำงานตาม Intent ที่ AI ตอบกลับมาจริง
             action = intent_data.get("action")
-            
+
+            # 3. แยกการทำงานตาม Intent จริง
             if action == "query":
-                # 🟢 แก้จุดที่ 1: เปลี่ยนมาเรียก get_buffer_data() ที่ประกาศไว้ในส่วนที่ 2
-                db_buffer = get_buffer_data()
-                await process_query_ui(channel, message, db_buffer)
+                await process_query_ui(channel, message)
 
             elif action == "set_budget":
                 budget_amount = intent_data.get("budget_amount")
                 if budget_amount:
-                    # 🟢 แก้จุดที่ 2: เรียก set_user_budget เพื่อบันทึกลง Database จริง
                     set_user_budget(message.author.id, float(budget_amount))
                     await channel.send(f"🎯 ตั้งงบประมาณเรียบร้อย: {float(budget_amount):,.2f} บาท")
                 else:
                     await channel.send("❌ ไม่สามารถระบุตัวเลขงบประมาณได้ กรุณาลองใหม่อีกครั้ง")
 
             else:
-                # บันทึกเป็น Transaction เฉพาะเมื่อ AI ยืนยันว่าเป็น Transaction จริงๆ
                 parsed_data = {"transactions": intent_data.get("transactions", [])}
                 if not parsed_data["transactions"]:
                     return
@@ -546,8 +520,10 @@ async def handle_incoming_message(channel, message, mode="insert"):
 
 @client.event
 async def on_message(message):
-    if message.type not in (discord.MessageType.default, discord.MessageType.reply): return
-    if message.author.id != ALLOWED_USER_ID or message.author == client.user: return
+    if message.type not in (discord.MessageType.default, discord.MessageType.reply): 
+        return
+    if message.author.id != ALLOWED_USER_ID or message.author == client.user: 
+        return
 
     text = message.content.strip()
     if text.lower() == "!menu":
@@ -558,15 +534,20 @@ async def on_message(message):
 
 @client.event
 async def on_message_edit(before, after):
-    if after.type not in (discord.MessageType.default, discord.MessageType.reply): return
-    if after.author.id != ALLOWED_USER_ID or after.author == client.user: return
-    if before.content == after.content: return
+    if after.type not in (discord.MessageType.default, discord.MessageType.reply): 
+        return
+    if after.author.id != ALLOWED_USER_ID or after.author == client.user: 
+        return
+    if before.content == after.content: 
+        return
     
     # ลบ UI ปุ่มเก่าย้อนหลังอัตโนมัติเมื่อกด Edit ข้อความ
     async for msg in after.channel.history(limit=20):
         if msg.author == client.user and msg.reference and msg.reference.message_id == after.id:
-            try: await msg.delete()
-            except: pass
+            try: 
+                await msg.delete()
+            except Exception: 
+                pass
     
     await handle_incoming_message(after.channel, after, mode="update")
 
@@ -587,8 +568,10 @@ async def daily_jobs():
     if today.day == SALARY_PAY_DAY:
         data = {"item_name": "เงินเดือน", "quantity": 1, "total_price": SALARY_AMOUNT, "transaction_type": "รายรับ", "category": "เงินเดือน"}
         msg_id = f"salary_{today.strftime('%Y%m')}"
-        try: insert_transaction(msg_id, "Auto-Salary", data)
-        except Exception: pass
+        try: 
+            insert_transaction(msg_id, "Auto-Salary", data)
+        except Exception: 
+            pass
 
 @client.event
 async def on_ready():
