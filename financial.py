@@ -3,6 +3,7 @@ import io
 import re
 import sys
 import json
+import difflib
 import asyncio
 import pandas as pd
 import traceback
@@ -128,20 +129,26 @@ def fetch_transactions_by_range(start_date: str = None, end_date: str = None):
     return response.data or []
 
 def load_item_cache_to_memory():
-    """โหลดประวัติรายการสินค้าขึ้น RAM ตอนเริ่มต้นระบบ"""
+    """โหลดประวัติรายการสินค้าและข้อความเดิมขึ้น RAM เพื่อจับคู่ด่วน"""
     global ITEM_CACHE
     try:
-        response = supabase.table("transactions").select("item_name, category, transaction_type").limit(5000).execute()
+        response = supabase.table("transactions").select("item_name, raw_text, category, transaction_type").limit(5000).execute()
         ITEM_CACHE.clear()
         if response.data:
             for row in response.data:
                 name = row.get("item_name")
+                raw = row.get("raw_text")
+                info = {
+                    "category": row.get("category", "ค่าสินค้า"),
+                    "transaction_type": row.get("transaction_type", "รายจ่าย")
+                }
+                # เก็บทั้งชื่อสินค้ามาตรฐาน และ raw_text เดิมที่เคยผ่าน AI มาแล้ว
                 if name and name.strip() and name.strip() != "ไม่ทราบชื่อ":
-                    ITEM_CACHE[name.strip().lower()] = {
-                        "category": row.get("category", "ค่าสินค้า"),
-                        "transaction_type": row.get("transaction_type", "รายจ่าย")
-                    }
-        print(f"[CACHE] Loaded {len(ITEM_CACHE)} items to memory.")
+                    ITEM_CACHE[name.strip().lower()] = info
+                if raw and raw.strip():
+                    ITEM_CACHE[raw.strip().lower()] = info
+                    
+        print(f"[CACHE] Loaded {len(ITEM_CACHE)} patterns to memory.")
     except Exception as e:
         print(f"[ERR] Cache load failed: {e}")
 
@@ -167,24 +174,45 @@ def set_user_budget(user_id: int, budget: float):
 # ==========================================
 # 3. AI ENGINE & SMART PARSER
 # ==========================================
+def find_best_cached_match(name: str, cache_dict: dict) -> dict | None:
+    """ค้นหาหมวดหมู่จาก RAM โดยรองรับคำพิมพ์ผิด/คำใกล้เคียง"""
+    key = name.lower().strip()
+    if key in cache_dict:
+        return cache_dict[key]
+
+    # ตรวจสอบว่าคำค้นมีส่วนย่อยตรงกับคีย์ใน RAM หรือไม่
+    for cached_name, info in cache_dict.items():
+        if cached_name in key or key in cached_name:
+            return info
+
+    # Fuzzy Matching คำใกล้เคียง (ความแม่นยำ 75% ขึ้นไป)
+    matches = difflib.get_close_matches(key, cache_dict.keys(), n=1, cutoff=0.75)
+    if matches:
+        return cache_dict[matches[0]]
+
+    return None
+
 def extract_multiple_items(text: str, cache_dict: dict):
-    """ดึงรายการสินค้าจาก RAM Cache โดยตรง ไม่เสีย Token"""
+    """ดึงรายการสินค้าจาก RAM Cache รองรับหลายรายการและคำพิมพ์ผิด (0 Token)"""
     if not text:
         return None
 
-    pattern = r'([ก-๙a-zA-Z][ก-๙a-zA-Z0-9\s-]*?)\s+(\d+(?:\.\d+)?)(?:\s*บาท)?'
+    # สกัดคู่ ข้อความ + ตัวเลขราคา เช่น "ไก่ย่าง 60", "น้ำตก 60 บาท"
+    pattern = r'([ก-๙a-zA-Z0-9\s-]+?)\s+(\d+(?:\.\d+)?)(?:\s*บาท|\s*฿)?'
     matches = re.findall(pattern, text)
     
     if not matches:
         return None
 
     transactions = []
-    for item_name, price_str in matches:
-        clean_name = item_name.strip()
-        cache_key = clean_name.lower()
+    for item_name_raw, price_str in matches:
+        clean_name = item_name_raw.strip()
+        # ข้ามคำสั้นเกินไปหรือคำเชื่อม
+        if not clean_name or len(clean_name) < 2:
+            return None
 
-        if cache_dict and cache_key in cache_dict:
-            cached_info = cache_dict[cache_key]
+        cached_info = find_best_cached_match(clean_name, cache_dict)
+        if cached_info:
             transactions.append({
                 "item_name": clean_name,
                 "quantity": 1,
@@ -193,6 +221,7 @@ def extract_multiple_items(text: str, cache_dict: dict):
                 "category": cached_info.get("category", "ค่าอาหาร")
             })
         else:
+            # หากมีแม้แต่รายการเดียวที่ไม่เคยบันทึก ให้ส่งต่อไปให้ AI เรียนรู้
             return None 
 
     return {"transactions": transactions} if transactions else None
