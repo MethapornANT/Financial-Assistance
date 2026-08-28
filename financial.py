@@ -55,7 +55,22 @@ ALLOWED_USER_ID = int(os.getenv("DISCORD_ALLOWED_USER_ID", 0))
 SALARY_AMOUNT = float(os.getenv("SALARY_AMOUNT", 30000))
 SALARY_PAY_DAY = int(os.getenv("SALARY_PAY_DAY", 25))
 
-MODEL_NAME = 'gemini-3.5-flash-lite'
+AI_MODELS = [
+    # --- 1. กลุ่ม Lite (ประหยัดสุด/เร็วสุด) ---
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.5-flash-lite",
+    
+    # --- 2. กลุ่ม Flash (มาตรฐาน) ---
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -63,6 +78,22 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 # Global In-Memory Cache สำหรับเก็บคำศัพท์ (0 Token)
 ITEM_CACHE = {}
 
+async def generate_with_fallback(contents, config):
+    """วนลูปยิงโมเดลทีละตัวจากเล็กไปใหญ่ ถ้าพังจะสลับไปตัวถัดไปทันที"""
+    last_error = None
+    for model_name in AI_MODELS:
+        try:
+            response = await ai_client.aio.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config
+            )
+            return response, model_name
+        except Exception as e:
+            print(f"[Fallback] {model_name} failed: {e}. Switching...")
+            last_error = e
+            continue
+    raise Exception(f"All AI Models failed! Last Error: {last_error}")
 
 # ==========================================
 # 2. DATABASE LAYER & CACHE MANAGER
@@ -166,7 +197,7 @@ def extract_multiple_items(text: str, cache_dict: dict):
 
     return {"transactions": transactions} if transactions else None
 
-async def parse_intent(text: str) -> dict:
+async def parse_intent(text: str) -> tuple[dict, str]:
     """วิเคราะห์เจตนาข้อความ: transaction, query หรือ set_budget"""
     prompt = f"""วิเคราะห์ข้อความ: "{text}"
 แยกแยะเจตนาของผู้ใช้เป็น 1 ใน 3 รูปแบบ:
@@ -188,18 +219,15 @@ async def parse_intent(text: str) -> dict:
         }}
     ]
 }}"""
-    response = await ai_client.aio.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
-    )
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
+    response, used_model = await generate_with_fallback(prompt, config)
     raw_text = response.text.strip()
     start_idx, end_idx = raw_text.find('{'), raw_text.rfind('}') + 1
     if start_idx != -1 and end_idx != 0:
-        return json.loads(raw_text[start_idx:end_idx])
+        return json.loads(raw_text[start_idx:end_idx]), used_model
     raise ValueError("Invalid JSON from parse_intent")
 
-async def parse_intent_with_retry(text: str, max_retries: int = 2) -> dict:
+async def parse_intent_with_retry(text: str, max_retries: int = 2) -> tuple[dict, str]:
     """ระบบ Auto-Retry เมื่อ AI เกิด Error 503 หรือ High Demand ชั่วคราว"""
     for attempt in range(max_retries + 1):
         try:
@@ -237,11 +265,8 @@ async def analyze_query_parameters(question: str) -> dict:
     "start_date": "YYYY-MM-DD",
     "end_date": "YYYY-MM-DD"
 }}"""
-    response = await ai_client.aio.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
-    )
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
+    response, _ = await generate_with_fallback(prompt, config)
     raw_text = response.text.strip()
     start_idx, end_idx = raw_text.find('{'), raw_text.rfind('}') + 1
     if start_idx != -1 and end_idx != 0:
@@ -306,12 +331,9 @@ async def generate_query_summary(question: str, final_data: list, user_id: int =
 3. ถ้าถามเปรียบเทียบรายรับ vs รายจ่าย ให้บอก รวมรายจ่าย, รวมรายรับ, ส่วนต่าง และสรุปว่าเกินหรือไม่ชัดเจน
 4. ห้ามสร้างตาราง Markdown เด็ดขาด"""
 
-    summary_res = await ai_client.aio.models.generate_content(
-        model=MODEL_NAME,
-        contents=summary_prompt,
-        config=types.GenerateContentConfig(temperature=0.0)
-    )
-    return summary_res.text.strip()
+    config = types.GenerateContentConfig(temperature=0.0)
+    response, used_model = await generate_with_fallback(summary_prompt, config)
+    return f"{response.text.strip()}\n\n*(⚡ Model: `{used_model}`)*"
 
 
 # ==========================================
@@ -417,12 +439,12 @@ async def send_clean_error(channel, error_obj):
     else:
         await channel.send("❌ ระบบขัดข้อง ไม่สามารถประมวลผลได้")
 
-async def process_transaction_ui(channel, message, parsed_data, mode, used_ai):
+async def process_transaction_ui(channel, message, parsed_data, mode, used_ai, used_model=""):
     """ส่งสรุปรายการให้ผู้ใช้กด Approve / Cancel"""
     summary = ""
     for item in parsed_data["transactions"]:
         summary += f"• `{item['item_name']}` | {item['quantity']}x | **{item['total_price']}฿**\n"
-    source_tag = "🤖 `[AI]`" if used_ai else "⚡ `[RAM]`"
+    source_tag = f"🤖 `[AI: {used_model}]`" if used_ai else "⚡ `[RAM]`"
     final_msg = f"{summary.strip()}\n{source_tag}"
     view = ApproveView(message.id, message.content, parsed_data, mode=mode)
     await message.reply(final_msg, view=view)
@@ -485,8 +507,8 @@ async def handle_incoming_message(channel, message, mode="insert"):
                 await process_transaction_ui(channel, message, parsed_data, mode, used_ai=False)
                 return
 
-            # 2. ส่ง AI วิเคราะห์ Intent พร้อมระบบ Auto-Retry
-            intent_data = await parse_intent_with_retry(message.content)
+            # 2. ส่ง AI วิเคราะห์ Intent พร้อมรับ used_model
+            intent_data, used_model = await parse_intent_with_retry(message.content)
             action = intent_data.get("action")
 
             # 3. แยกการทำงานตาม Intent จริง
@@ -497,7 +519,7 @@ async def handle_incoming_message(channel, message, mode="insert"):
                 budget_amount = intent_data.get("budget_amount")
                 if budget_amount:
                     set_user_budget(message.author.id, float(budget_amount))
-                    await channel.send(f"🎯 ตั้งงบประมาณเรียบร้อย: {float(budget_amount):,.2f} บาท")
+                    await channel.send(f"🎯 ตั้งงบประมาณเรียบร้อย: {float(budget_amount):,.2f} บาท\n*(⚡ Model: `{used_model}`)*")
                 else:
                     await channel.send("❌ ไม่สามารถระบุตัวเลขงบประมาณได้ กรุณาลองใหม่อีกครั้ง")
 
@@ -513,7 +535,7 @@ async def handle_incoming_message(channel, message, mode="insert"):
                             "category": item.get("category", "ค่าสินค้า"),
                             "transaction_type": item.get("transaction_type", "รายจ่าย")
                         }
-                await process_transaction_ui(channel, message, parsed_data, mode, used_ai=True)
+                await process_transaction_ui(channel, message, parsed_data, mode, used_ai=True, used_model=used_model)
 
         except Exception as e:
             await send_clean_error(channel, e)
@@ -526,6 +548,15 @@ async def on_message(message):
         return
 
     text = message.content.strip()
+
+    # 1. ข้ามทันทีถ้าเป็นคำสั่งของ workspace_bot (!dev)
+    if text.lower().startswith("!dev"):
+        return
+
+    # 2. ข้ามทันทีถ้าพิมพ์อยู่ในห้อง codex
+    if hasattr(message.channel, "name") and "codex" in message.channel.name.lower():
+        return
+
     if text.lower() == "!menu":
         await message.channel.send("⚡ เมนูด่วน", view=QuickActionView())
         return
@@ -539,6 +570,12 @@ async def on_message_edit(before, after):
     if after.author.id != ALLOWED_USER_ID or after.author == client.user: 
         return
     if before.content == after.content: 
+        return
+
+    # ข้ามข้อความแก้ถ้าเป็น !dev หรืออยู่ในห้อง codex
+    if after.content.strip().lower().startswith("!dev"):
+        return
+    if hasattr(after.channel, "name") and "codex" in after.channel.name.lower():
         return
     
     # ลบ UI ปุ่มเก่าย้อนหลังอัตโนมัติเมื่อกด Edit ข้อความ
@@ -575,7 +612,7 @@ async def daily_jobs():
 
 @client.event
 async def on_ready():
-    print(f"[OK] Online as {client.user} | Model: {MODEL_NAME}")
+    print(f"[OK] Online as {client.user} | Multi-Model Auto Fallback: Active")
     load_item_cache_to_memory()
     if not daily_jobs.is_running(): 
         daily_jobs.start()
